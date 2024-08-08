@@ -2,6 +2,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use nostr::{Event, EventId, PublicKey};
+use nostr::prelude::Nip19;
 use nostr::util::hex;
 use nostr_database::{FlatBufferBuilder, FlatBufferDecode, FlatBufferEncode};
 use sled::{Db, IVec};
@@ -85,8 +86,13 @@ impl SledDatabase {
         new_val
     }
 
-    pub fn event_by_id(&self, event_id: EventId) -> Result<Event, anyhow::Error> {
-        match self.db.get(event_id.as_bytes()) {
+    pub fn event_by_id(&self, event_id: &Nip19) -> Result<Event, anyhow::Error> {
+        let id_key = match event_id {
+            Nip19::EventId(e) => e.as_bytes(),
+            Nip19::Event(e) => e.event_id.as_bytes(),
+            _ => return Err(anyhow::Error::msg("Not supported ID format"))
+        };
+        match self.db.get(id_key) {
             Ok(v) => match v {
                 Some(v) => match Event::decode(&v) {
                     Ok(v) => Ok(v),
@@ -103,7 +109,7 @@ impl SledDatabase {
         match self.db.get(rpk) {
             Ok(v) => match v {
                 Some(v) => {
-                    self.event_by_id(EventId::from_slice(v[8..].as_ref())?)
+                    self.event_by_id(&Nip19::EventId(EventId::from_slice(v[8..].as_ref())?))
                 }
                 None => Err(anyhow::Error::msg("Not Found"))
             }

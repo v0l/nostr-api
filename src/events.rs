@@ -1,4 +1,5 @@
-use nostr::{Event, EventId, PublicKey};
+use nostr::{Event, FromBech32, PublicKey};
+use nostr::prelude::Nip19;
 use rocket::{Route, State};
 use rocket::http::Status;
 use rocket::serde::json::Json;
@@ -32,11 +33,11 @@ fn get_event(
     db: &State<SledDatabase>,
     id: &str,
 ) -> Option<Json<Event>> {
-    let id = match EventId::parse(id) {
+    let id = match Nip19::from_bech32(id) {
         Ok(i) => i,
         _ => return None
     };
-    match db.event_by_id(id) {
+    match db.event_by_id(&id) {
         Ok(ev) => Some(Json::from(ev)),
         _ => None
     }
