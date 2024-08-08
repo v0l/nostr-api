@@ -1,7 +1,8 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use nostr::{Event, EventId};
+use nostr::{Event, EventId, PublicKey};
+use nostr::util::hex;
 use nostr_database::{FlatBufferBuilder, FlatBufferDecode, FlatBufferEncode};
 use sled::{Db, IVec};
 use tokio::sync::Mutex;
@@ -34,31 +35,46 @@ impl SledDatabase {
     }
 
     fn write_replaceable_index(&self, event: &Event) -> Result<bool, anyhow::Error> {
-        let rpk = Self::replaceable_index_key(event);
+        let rpk = Self::replaceable_index_key_of_event(event);
 
-        if let Err(e) = self.db.update_and_fetch(rpk, |prev| {
+        match self.db.update_and_fetch(rpk, |prev| {
             if let Some(prev) = prev {
                 let timestamp: u64 = u64::from_be_bytes(prev[..8].try_into().unwrap());
                 if timestamp < event.created_at.as_u64() {
                     let new_val = Self::replaceable_index_value(event);
                     Some(IVec::from(new_val.as_slice()))
                 } else {
-                    None
+                    Some(IVec::from(prev))
                 }
             } else {
                 let new_val = Self::replaceable_index_value(event);
                 Some(IVec::from(new_val.as_slice()))
             }
         }) {
-            return Err(anyhow::Error::new(e));
+            Err(e) => Err(anyhow::Error::new(e)),
+            Ok(v) => {
+                match v {
+                    Some(v) => {
+                        info!("Wrote index {} = {}", hex::encode(rpk), hex::encode(v.as_ref()));
+                        Ok(true)
+                    }
+                    None => {
+                        info!("Duplicate or older index {}", hex::encode(rpk));
+                        Ok(false)
+                    }
+                }
+            }
         }
-        Ok(false)
     }
 
-    fn replaceable_index_key(event: &Event) -> [u8; 36] {
+    fn replaceable_index_key_of_event(event: &Event) -> [u8; 36] {
+        Self::replaceable_index_key(event.kind.as_u32(), &event.pubkey)
+    }
+
+    fn replaceable_index_key(kind: u32, pubkey: &PublicKey) -> [u8; 36] {
         let mut rpk = [0; 4 + 32]; // kind:pubkey
-        rpk[..4].copy_from_slice(&event.kind.as_u32().to_be_bytes());
-        rpk[4..].copy_from_slice(&event.pubkey.to_bytes());
+        rpk[..4].copy_from_slice(&kind.to_be_bytes());
+        rpk[4..].copy_from_slice(&pubkey.to_bytes());
         rpk
     }
 
@@ -69,13 +85,26 @@ impl SledDatabase {
         new_val
     }
 
-    pub async fn event_by_id(&self, event_id: EventId) -> Result<Event, anyhow::Error> {
+    pub fn event_by_id(&self, event_id: EventId) -> Result<Event, anyhow::Error> {
         match self.db.get(event_id.as_bytes()) {
             Ok(v) => match v {
                 Some(v) => match Event::decode(&v) {
                     Ok(v) => Ok(v),
                     Err(e) => Err(anyhow::Error::new(e))
                 },
+                None => Err(anyhow::Error::msg("Not Found"))
+            }
+            Err(e) => Err(anyhow::Error::new(e))
+        }
+    }
+
+    pub fn event_by_kind_pubkey(&self, kind: u32, pubkey: &PublicKey) -> Result<Event, anyhow::Error> {
+        let rpk = Self::replaceable_index_key(kind, pubkey);
+        match self.db.get(rpk) {
+            Ok(v) => match v {
+                Some(v) => {
+                    self.event_by_id(EventId::from_slice(v[8..].as_ref())?)
+                }
                 None => Err(anyhow::Error::msg("Not Found"))
             }
             Err(e) => Err(anyhow::Error::new(e))
