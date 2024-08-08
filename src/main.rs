@@ -2,8 +2,6 @@
 extern crate rocket;
 
 use anyhow::Error;
-use nostr::Event;
-use nostr_database::{DynNostrDatabase, NostrDatabase};
 use rocket::shield::Shield;
 
 use crate::store::SledDatabase;

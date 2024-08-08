@@ -1,6 +1,4 @@
-use anyhow::Error;
-use nostr::{Event, EventId, JsonUtil, Kind, PublicKey};
-use nostr_database::{DatabaseError, DynNostrDatabase, NostrDatabase};
+use nostr::{Event, EventId, PublicKey};
 use rocket::{Route, State};
 use rocket::http::Status;
 use rocket::serde::json::Json;
