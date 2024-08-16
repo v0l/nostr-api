@@ -4,6 +4,7 @@ use rocket::{Route, State};
 use rocket::http::Status;
 use rocket::serde::json::Json;
 
+use crate::fetch::FetchQueue;
 use crate::store::SledDatabase;
 
 pub fn routes() -> Vec<Route> {
@@ -29,8 +30,9 @@ async fn import_event(
 }
 
 #[rocket::get("/event/<id>")]
-fn get_event(
+async fn get_event(
     db: &State<SledDatabase>,
+    fetch: &State<FetchQueue>,
     id: &str,
 ) -> Option<Json<Event>> {
     let id = match Nip19::from_bech32(id) {
@@ -39,7 +41,13 @@ fn get_event(
     };
     match db.event_by_id(&id) {
         Ok(ev) => Some(Json::from(ev)),
-        _ => None
+        _ => {
+            let mut fetch = fetch.inner().clone();
+            match fetch.demand(&id).await.await {
+                Ok(Some(ev)) => Some(Json::from(ev)),
+                _ => None
+            }
+        }
     }
 }
 
