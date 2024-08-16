@@ -1,9 +1,9 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use nostr::{Event, EventId, PublicKey};
 use nostr::prelude::Nip19;
 use nostr::util::hex;
+use nostr::{Event, EventId, PublicKey};
 use nostr_database::{FlatBufferBuilder, FlatBufferDecode, FlatBufferEncode};
 use sled::{Db, IVec};
 use tokio::sync::Mutex;
@@ -53,18 +53,20 @@ impl SledDatabase {
             }
         }) {
             Err(e) => Err(anyhow::Error::new(e)),
-            Ok(v) => {
-                match v {
-                    Some(v) => {
-                        info!("Wrote index {} = {}", hex::encode(rpk), hex::encode(v.as_ref()));
-                        Ok(true)
-                    }
-                    None => {
-                        info!("Duplicate or older index {}", hex::encode(rpk));
-                        Ok(false)
-                    }
+            Ok(v) => match v {
+                Some(v) => {
+                    info!(
+                        "Wrote index {} = {}",
+                        hex::encode(rpk),
+                        hex::encode(v.as_ref())
+                    );
+                    Ok(true)
                 }
-            }
+                None => {
+                    info!("Duplicate or older index {}", hex::encode(rpk));
+                    Ok(false)
+                }
+            },
         }
     }
 
@@ -90,30 +92,32 @@ impl SledDatabase {
         let id_key = match event_id {
             Nip19::EventId(e) => e.as_bytes(),
             Nip19::Event(e) => e.event_id.as_bytes(),
-            _ => return Err(anyhow::Error::msg("Not supported ID format"))
+            _ => return Err(anyhow::Error::msg("Not supported ID format")),
         };
         match self.db.get(id_key) {
             Ok(v) => match v {
                 Some(v) => match Event::decode(&v) {
                     Ok(v) => Ok(v),
-                    Err(e) => Err(anyhow::Error::new(e))
+                    Err(e) => Err(anyhow::Error::new(e)),
                 },
-                None => Err(anyhow::Error::msg("Not Found"))
-            }
-            Err(e) => Err(anyhow::Error::new(e))
+                None => Err(anyhow::Error::msg("Not Found")),
+            },
+            Err(e) => Err(anyhow::Error::new(e)),
         }
     }
 
-    pub fn event_by_kind_pubkey(&self, kind: u32, pubkey: &PublicKey) -> Result<Event, anyhow::Error> {
+    pub fn event_by_kind_pubkey(
+        &self,
+        kind: u32,
+        pubkey: &PublicKey,
+    ) -> Result<Event, anyhow::Error> {
         let rpk = Self::replaceable_index_key(kind, pubkey);
         match self.db.get(rpk) {
             Ok(v) => match v {
-                Some(v) => {
-                    self.event_by_id(&Nip19::EventId(EventId::from_slice(v[8..].as_ref())?))
-                }
-                None => Err(anyhow::Error::msg("Not Found"))
-            }
-            Err(e) => Err(anyhow::Error::new(e))
+                Some(v) => self.event_by_id(&Nip19::EventId(EventId::from_slice(v[8..].as_ref())?)),
+                None => Err(anyhow::Error::msg("Not Found")),
+            },
+            Err(e) => Err(anyhow::Error::new(e)),
         }
     }
 }

@@ -1,0 +1,7 @@
+
+# List of relays to connect to for fetching data
+relays = [
+    "wss://relay.snort.social",
+    "wss://relay.damus.io",
+    "wss://nos.lol"
+]

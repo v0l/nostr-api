@@ -4,23 +4,37 @@ extern crate rocket;
 use std::time::Duration;
 
 use anyhow::Error;
+use config::Config;
 use rocket::shield::Shield;
 
 use crate::fetch::FetchQueue;
+use crate::settings::Settings;
 use crate::store::SledDatabase;
 
 mod events;
-mod store;
 mod fetch;
+mod store;
+mod settings;
 
 #[rocket::main]
 async fn main() -> Result<(), Error> {
     pretty_env_logger::init();
 
+    let builder = Config::builder()
+        .add_source(config::File::with_name("config.toml"))
+        .add_source(config::Environment::with_prefix("APP"))
+        .build()?;
+
+    let settings: Settings = builder.try_deserialize()?;
+
     let db = SledDatabase::new("nostr.db");
 
     let mut fetch = FetchQueue::new();
-    fetch.add_relay("wss://relay.snort.social".parse().unwrap()).await.unwrap();
+    for x in settings.relays
+    {
+        fetch.add_relay(x).await.unwrap();
+    }
+
 
     let fetch2 = fetch.clone();
     tokio::spawn(async move {
