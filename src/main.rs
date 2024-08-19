@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate rocket;
 
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::Error;
@@ -44,7 +45,15 @@ async fn main() -> Result<(), Error> {
         }
     });
 
-    let rocket = rocket::Rocket::build()
+    let mut config = rocket::Config::default();
+    let ip: SocketAddr = match &settings.listen {
+        Some(i) => i.parse().unwrap(),
+        None => SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 8000)
+    };
+    config.address = ip.ip();
+    config.port = ip.port();
+
+    let rocket = rocket::Rocket::custom(config)
         .manage(db)
         .manage(fetch)
         .attach(Shield::new()) // disable
