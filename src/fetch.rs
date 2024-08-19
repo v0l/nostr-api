@@ -2,10 +2,10 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
+use nostr::{Event, EventId, Filter, Kind, Url};
 use nostr::prelude::Nip19;
-use nostr::{Event, Filter, Url};
 use nostr_sdk::{FilterOptions, RelayOptions, RelayPool};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, oneshot};
 
 struct QueueItem {
     pub handler: oneshot::Sender<Option<Event>>,
@@ -74,8 +74,21 @@ impl FetchQueue {
     fn nip19_to_filter(filter: &Nip19) -> Option<Filter> {
         match filter {
             Nip19::Coordinate(c) => Some(Filter::from(c)),
-            Nip19::Event(e) => Some(Filter::new().id(e.event_id)),
+            Nip19::Event(e) => {
+                let mut f = Filter::new();
+                if e.event_id.ne(&EventId::all_zeros()) {
+                    f = f.id(e.event_id);
+                }
+                if let Some(a) = e.author {
+                    f = f.author(a);
+                }
+                if let Some(k) = e.kind {
+                    f = f.kind(k);
+                }
+                Some(f)
+            }
             Nip19::EventId(e) => Some(Filter::new().id(*e)),
+            Nip19::Pubkey(pk) => Some(Filter::new().author(*pk).kind(Kind::Metadata)),
             _ => None,
         }
     }

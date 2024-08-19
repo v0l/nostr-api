@@ -1,8 +1,8 @@
-use nostr::prelude::Nip19;
-use nostr::{Event, FromBech32, PublicKey};
+use nostr::{Event, EventId, FromBech32, Kind, PublicKey};
+use nostr::prelude::{Nip19, Nip19Event};
+use rocket::{Route, State};
 use rocket::http::Status;
 use rocket::serde::json::Json;
-use rocket::{Route, State};
 
 use crate::fetch::FetchQueue;
 use crate::store::SledDatabase;
@@ -41,7 +41,12 @@ async fn get_event(
         _ => {
             let mut fetch = fetch.inner().clone();
             match fetch.demand(&id).await.await {
-                Ok(Some(ev)) => Some(Json::from(ev)),
+                Ok(Some(ev)) => {
+                    if let Err(e) = db.save_event(&ev).await {
+                        warn!("Failed to save event {}", e);
+                    }
+                    Some(Json::from(ev))
+                }
                 _ => None,
             }
         }
@@ -49,13 +54,37 @@ async fn get_event(
 }
 
 #[rocket::get("/event/<kind>/<pubkey>")]
-fn get_event_by_kind(db: &State<SledDatabase>, kind: u32, pubkey: &str) -> Option<Json<Event>> {
+async fn get_event_by_kind(
+    db: &State<SledDatabase>,
+    fetch: &State<FetchQueue>,
+    kind: u32, pubkey: &str,
+) -> Option<Json<Event>> {
     let pk = match PublicKey::parse(pubkey) {
         Ok(i) => i,
         _ => return None,
     };
-    match db.event_by_kind_pubkey(kind, &pk) {
+    let kind = Kind::from(kind as u16);
+    if !kind.is_replaceable() {
+        return None;
+    }
+    match db.event_by_kind_pubkey(kind.as_u32(), &pk) {
         Ok(ev) => Some(Json::from(ev)),
-        _ => None,
+        _ => {
+            let mut fetch = fetch.inner().clone();
+            match fetch.demand(&Nip19::Event(Nip19Event {
+                event_id: EventId::all_zeros(),
+                kind: Some(kind),
+                author: Some(pk),
+                relays: vec![],
+            })).await.await {
+                Ok(Some(ev)) => {
+                    if let Err(e) = db.save_event(&ev).await {
+                        warn!("Failed to save event {}", e);
+                    }
+                    Some(Json::from(ev))
+                }
+                _ => None
+            }
+        }
     }
 }
