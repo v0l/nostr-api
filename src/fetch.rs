@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nostr::prelude::Nip19;
-use nostr::{Event, EventId, Filter, Kind, Url};
+use nostr::{serde_json, Event, EventId, Filter, Kind, Url};
 use nostr_sdk::{FilterOptions, RelayOptions, RelayPool};
 use tokio::sync::{oneshot, Mutex};
 
@@ -59,7 +59,7 @@ impl FetchQueue {
             batch.iter().map(move |x| Self::nip19_to_filter(&x.request).unwrap()).collect();
 
         let pool_lock = self.pool.lock().await;
-        info!("Sending filters: {:?}", &filters);
+        info!("Sending filters: {}", serde_json::to_string(&filters).unwrap());
         if let Ok(evs) = pool_lock
             .get_events_of(filters, Duration::from_secs(2), FilterOptions::ExitOnEOSE)
             .await
