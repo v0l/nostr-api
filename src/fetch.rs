@@ -55,19 +55,21 @@ impl FetchQueue {
         while let Some(q) = q_lock.pop_front() {
             batch.push(q);
         }
-        let filters: Vec<Filter> =
-            batch.iter().map(move |x| Self::nip19_to_filter(&x.request).unwrap()).collect();
+        if batch.len() > 0 {
+            let filters: Vec<Filter> =
+                batch.iter().map(move |x| Self::nip19_to_filter(&x.request).unwrap()).collect();
 
-        let pool_lock = self.pool.lock().await;
-        info!("Sending filters: {}", serde_json::to_string(&filters).unwrap());
-        if let Ok(evs) = pool_lock
-            .get_events_of(filters, Duration::from_secs(2), FilterOptions::ExitOnEOSE)
-            .await
-        {
-            for b in batch {
-                let f = Self::nip19_to_filter(&b.request).unwrap();
-                let ev = evs.iter().find(|e| f.match_event(e));
-                b.handler.send(ev.cloned()).unwrap()
+            let pool_lock = self.pool.lock().await;
+            info!("Sending filters: {}", serde_json::to_string(&filters).unwrap());
+            if let Ok(evs) = pool_lock
+                .get_events_of(filters, Duration::from_secs(2), FilterOptions::ExitOnEOSE)
+                .await
+            {
+                for b in batch {
+                    let f = Self::nip19_to_filter(&b.request).unwrap();
+                    let ev = evs.iter().find(|e| f.match_event(e));
+                    b.handler.send(ev.cloned()).unwrap()
+                }
             }
         }
     }
