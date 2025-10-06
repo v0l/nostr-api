@@ -10,7 +10,8 @@ use nostr_sdk::{
 use rocket::data::ByteUnit;
 use rocket::http::Status;
 use rocket::{Data, Route, State};
-use scraper::{Html, Selector};
+use scraper::{ElementRef, Html, Selector};
+use std::fmt::{Display, Formatter};
 
 pub fn routes() -> Vec<Route> {
     routes![tag_page]
@@ -20,17 +21,93 @@ pub fn routes() -> Vec<Route> {
 struct HeadElement {
     element: String,
     attributes: Vec<(String, String)>,
+    content: Option<String>,
 }
 
 impl HeadElement {
-    fn new(element: &str, attributes: Vec<(&str, &str)>) -> Self {
+    fn new<S>(element: S, attributes: &[(S, S)], content: Option<S>) -> Self
+    where
+        S: ToString,
+    {
         Self {
             element: element.to_string(),
             attributes: attributes
-                .into_iter()
+                .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            content: content.map(|t| t.to_string()),
         }
+    }
+
+    pub fn as_title(&self) -> Option<HeadElement> {
+        // allow og:title to replace title
+        let is_title = self.element == "meta"
+            && self
+                .attributes
+                .iter()
+                .any(|t| t.0 == "property" && t.1 == "og:title");
+        if is_title {
+            Some(HeadElement::new("title", &[], self.meta_content()))
+        } else {
+            None
+        }
+    }
+
+    pub fn meta_content(&self) -> Option<&str> {
+        if self.element == "meta" {
+            self.attributes
+                .iter()
+                .find(|t| t.0 == "content")
+                .map(|t| t.1.as_str())
+        } else {
+            None
+        }
+    }
+
+    pub fn replace_with(&self, node: ElementRef) -> Option<HeadElement> {
+        if self.is_match(node) {
+            return Some(self.clone());
+        }
+        if node.value().name.local.as_ref() == "title"
+            && let Some(t) = self.as_title()
+        {
+            return Some(t);
+        }
+        None
+    }
+
+    fn is_match(&self, node: ElementRef) -> bool {
+        let name = node.value().name.local.as_ref();
+        self.element == name
+            && match name {
+                "meta" => {
+                    let prop_child = node.attr("property").or(node.attr("name"));
+                    let prop_tag = self
+                        .attributes
+                        .iter()
+                        .find(|p| p.0 == "property" || p.0 == "name")
+                        .map(|p| p.1.as_str());
+                    prop_child == prop_tag
+                }
+                _ => false,
+            }
+    }
+}
+
+impl Display for HeadElement {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{}", self.element)?;
+        for (k, v) in &self.attributes {
+            write!(f, " {}=\"{}\"", k, v)?;
+        }
+        if let Some(c) = &self.content {
+            write!(f, ">")?;
+            write!(f, "{}", c)?;
+            write!(f, "</{}>", self.element)?;
+        } else {
+            write!(f, " />")?;
+        }
+        Ok(())
     }
 }
 
@@ -65,15 +142,15 @@ async fn tag_page(
         Err(_) => return Ok((Status::Ok, html)),
     };
 
-    let mut tags = Vec::new();
-
-    match &nid {
+    let tags = match &nid {
         Nip19::EventId(_) | Nip19::Event(_) | Nip19::Coordinate(_) => {
             if let Some(ev) = fetch.demand(&nid).await.map_err(|e| {
                 warn!("Failed to fetch event: {}", e);
                 Status::InternalServerError
             })? {
-                tags = get_event_tags(fetch, &ev, &canonical).await;
+                get_event_tags(fetch, &ev, &canonical).await
+            } else {
+                Vec::new()
             }
         }
         Nip19::Profile(_) | Nip19::Pubkey(_) => {
@@ -98,7 +175,7 @@ async fn tag_page(
                 .map(|p| p.description.clone())
                 .unwrap_or_default();
 
-            tags = meta_tags_to_elements(vec![
+            meta_tags_to_elements(vec![
                 ("og:type", "profile"),
                 ("og:title", &title),
                 ("og:description", &description),
@@ -107,25 +184,18 @@ async fn tag_page(
                 ("twitter:title", &title),
                 ("twitter:description", &description),
                 ("twitter:image", &image),
-            ]);
-
-            if let Some(canonical_template) = canonical {
-                if canonical_template.contains("%s") {
-                    let bech32 = nid.to_bech32().unwrap_or_default();
-                    let canonical_url = canonical_template.replace("%s", &bech32);
-                    tags.push(HeadElement::new(
-                        "link",
-                        vec![("rel", "canonical"), ("href", &canonical_url)],
-                    ));
-                }
-            }
+            ])
         }
-        _ => return Ok((Status::Ok, html)),
-    }
+        _ => Vec::new(),
+    };
 
-    info!("Injecting {} tags for {}", tags.len(), id);
-    let result_html = inject_tags(&html, tags);
-    Ok((Status::Ok, result_html))
+    if tags.is_empty() {
+        Ok((Status::Ok, html))
+    } else {
+        info!("Injecting {} tags for {}", tags.len(), id);
+        let result_html = inject_tags(&html, tags);
+        Ok((Status::Ok, result_html))
+    }
 }
 
 async fn get_event_tags(
@@ -299,7 +369,8 @@ async fn get_event_tags(
                 let canonical_url = canonical_template.replace("%s", &b);
                 tags.push(HeadElement::new(
                     "link",
-                    vec![("rel", "canonical"), ("href", &canonical_url)],
+                    &[("rel", "canonical"), ("href", canonical_url.as_str())],
+                    None,
                 ));
             }
         }
@@ -349,83 +420,44 @@ async fn get_profile_meta(fetch: &State<FetchQueue>, pubkey: &PublicKey) -> Opti
 
 fn inject_tags(html: &str, tags: Vec<HeadElement>) -> String {
     let doc = Html::parse_document(html);
-    let head_selector = Selector::parse("head").unwrap();
+    let head_selector = Selector::parse("head").expect("invalid selector");
 
-    let mut html_string = html.to_string();
+    if let Some(head_element) = doc.select(&head_selector).next() {
+        let mut new_head_content = String::new();
 
-    // Find the head tag position
-    if doc.select(&head_selector).next().is_some() {
-        let mut injected_tags = String::new();
-
-        for tag_elem in &tags {
-            if tag_elem.element == "meta" {
-                let mut tag_string = String::from("<meta");
-                for (key, value) in &tag_elem.attributes {
-                    tag_string.push_str(&format!(" {}=\"{}\"", key, value));
-                }
-                tag_string.push_str(">\n");
-                injected_tags.push_str(&tag_string);
-
-                // Handle og:title -> update title tag
-                if tag_elem
-                    .attributes
-                    .iter()
-                    .any(|(k, v)| k == "property" && v == "og:title")
-                {
-                    if let Some((_, content)) =
-                        tag_elem.attributes.iter().find(|(k, _)| k == "content")
-                    {
-                        if !content.is_empty() {
-                            // We'll inject a title tag
-                            injected_tags.push_str(&format!("<title>{}</title>\n", content));
-                        }
-                    }
-                }
-
-                // Handle og:description -> update description meta tag
-                if tag_elem
-                    .attributes
-                    .iter()
-                    .any(|(k, v)| k == "property" && v == "og:description")
-                {
-                    if let Some((_, content)) =
-                        tag_elem.attributes.iter().find(|(k, _)| k == "content")
-                    {
-                        if !content.is_empty() {
-                            injected_tags.push_str(&format!(
-                                "<meta name=\"description\" content=\"{}\">\n",
-                                content
-                            ));
-                        }
-                    }
-                }
-            } else if tag_elem.element == "link" {
-                let mut tag_string = String::from("<link");
-                for (key, value) in &tag_elem.attributes {
-                    tag_string.push_str(&format!(" {}=\"{}\"", key, value));
-                }
-                tag_string.push_str(">\n");
-                injected_tags.push_str(&tag_string);
+        // Iterate through existing head children
+        for child in head_element.child_elements() {
+            let replace_with = tags.iter().find_map(|t| t.replace_with(child));
+            new_head_content.push('\n');
+            if let Some(replace_with) = replace_with {
+                new_head_content.push_str(replace_with.to_string().as_str());
+            } else {
+                new_head_content.push_str(child.html().as_str());
             }
         }
 
-        // Insert tags at the beginning of <head>
-        if let Some(head_start) = html_string.find("<head")
-            && let Some(head_end) = html_string[head_start..].find('>')
+        // Replace the entire head element
+        let mut html_string = html.to_string();
+        if let Some(hs) = html_string.find("<head")
+            && let Some(head_start_end) = html_string[hs..].find(">")
+            && let Some(head_close) = html_string[head_start_end..].find("</head>")
         {
-            let insert_pos = head_start + head_end + 1;
-            html_string.insert_str(insert_pos, &format!("\n{}", injected_tags));
-        } else {
-            warn!("Cant find head in html document, inserting at end of html");
-            html_string.push_str(&injected_tags);
+            let head_start = hs + head_start_end + 1;
+            let head_end = head_start_end + head_close;
+            html_string.replace_range(head_start..head_end, &new_head_content);
         }
-    }
 
-    html_string
+        html_string
+    } else {
+        warn!("No head element found in document");
+        html.to_string()
+    }
 }
 
 fn meta_tags_to_elements(tags: Vec<(&str, &str)>) -> Vec<HeadElement> {
     tags.into_iter()
-        .map(|(key, value)| HeadElement::new("meta", vec![("property", key), ("content", value)]))
+        .map(|(key, value)| {
+            HeadElement::new("meta", &[("property", key), ("content", value)], None)
+        })
         .collect()
 }
