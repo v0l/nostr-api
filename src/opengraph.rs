@@ -4,8 +4,8 @@ use chrono::DateTime;
 use nostr_sdk::nips::nip19::Nip19;
 use nostr_sdk::prelude::{Nip19Coordinate, Nip19Event};
 use nostr_sdk::{
-    Alphabet, Event, EventId, FromBech32, JsonUtil, Kind, PublicKey, SingleLetterTag,
-    TagKind, ToBech32,
+    Alphabet, Event, EventId, FromBech32, JsonUtil, Kind, PublicKey, SingleLetterTag, TagKind,
+    ToBech32,
 };
 use rocket::data::ByteUnit;
 use rocket::http::Status;
@@ -410,11 +410,11 @@ fn inject_tags(html: &str, tags: Vec<HeadElement>) -> String {
         }
 
         // Insert tags at the beginning of <head>
-        if let Some(head_start) = html_string.find("<head") {
-            if let Some(head_end) = html_string[head_start..].find('>') {
-                let insert_pos = head_start + head_end + 1;
-                html_string.insert_str(insert_pos, &format!("\n{}", injected_tags));
-            }
+        if let Some(head_start) = html_string.find("<head")
+            && let Some(head_end) = html_string[head_start..].find('>')
+        {
+            let insert_pos = head_start + head_end + 1;
+            html_string.insert_str(insert_pos, &format!("\n{}", injected_tags));
         } else {
             warn!("Cant find head in html document, inserting at end of html");
             html_string.push_str(&injected_tags);
