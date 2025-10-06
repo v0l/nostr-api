@@ -4,8 +4,7 @@ use chrono::DateTime;
 use nostr_sdk::nips::nip19::Nip19;
 use nostr_sdk::prelude::{Nip19Coordinate, Nip19Event};
 use nostr_sdk::{
-    Alphabet, Event, EventId, FromBech32, JsonUtil, Kind, PublicKey, SingleLetterTag, TagKind,
-    ToBech32,
+    Alphabet, Event, FromBech32, Kind, Metadata, PublicKey, SingleLetterTag, TagKind, ToBech32,
 };
 use rocket::data::ByteUnit;
 use rocket::http::Status;
@@ -116,6 +115,7 @@ struct ProfileMeta {
     title: String,
     description: String,
     image: String,
+    profile: Metadata,
 }
 
 /// Inject opengraph tags into provided html
@@ -204,12 +204,6 @@ async fn get_event_tags(
     ev: &Event,
     canonical: &Option<&str>,
 ) -> Vec<HeadElement> {
-    let profile = get_profile_event(fetch, &ev.pubkey).await;
-    let name = profile
-        .as_ref()
-        .and_then(|p| p.name.as_deref())
-        .unwrap_or("Nostrich");
-
     let mut tags = match ev.kind {
         Kind::LiveEvent => {
             // Live event (kind 30311)
@@ -226,11 +220,11 @@ async fn get_event_tags(
                 })
                 .unwrap_or(ev.pubkey);
 
-            let host_profile = get_profile_event(fetch, &host_pubkey).await;
-            let host_name = host_profile
+            let profile = get_profile_meta(fetch, &host_pubkey).await;
+            let host_name = profile
                 .as_ref()
-                .and_then(|p| p.name.as_deref())
-                .unwrap_or(name);
+                .and_then(|p| p.profile.name.as_deref())
+                .unwrap_or("Nostrich");
 
             let stream = ev
                 .tags
@@ -244,7 +238,7 @@ async fn get_event_tags(
                 .find(TagKind::Image)
                 .and_then(|t| t.content())
                 .map(|s| s.to_string())
-                .or_else(|| host_profile.as_ref().and_then(|p| p.picture.clone()))
+                .or_else(|| profile.as_ref().and_then(|p| p.profile.picture.clone()))
                 .unwrap_or_else(|| default_avatar(&host_pubkey.to_hex()));
 
             let title_tag = ev
@@ -285,6 +279,12 @@ async fn get_event_tags(
             ])
         }
         Kind::Custom(1313) => {
+            let profile = get_profile_meta(fetch, &ev.pubkey).await;
+            let name = profile
+                .as_ref()
+                .and_then(|p| p.profile.name.as_deref())
+                .unwrap_or("Nostrich");
+
             // Stream clip
             let stream = ev
                 .tags
@@ -299,7 +299,7 @@ async fn get_event_tags(
                 .find(TagKind::Image)
                 .and_then(|t| t.content())
                 .map(|s| s.to_string())
-                .or_else(|| profile.as_ref().and_then(|p| p.picture.clone()))
+                .or_else(|| profile.as_ref().and_then(|p| p.profile.picture.clone()))
                 .unwrap_or_else(|| default_avatar(&ev.pubkey.to_hex()));
 
             let title_tag = ev
@@ -324,6 +324,12 @@ async fn get_event_tags(
         }
         _ => {
             // Default case for regular posts
+            let profile = get_profile_meta(fetch, &ev.pubkey).await;
+            let name = profile
+                .as_ref()
+                .and_then(|p| p.profile.name.as_deref())
+                .unwrap_or("Nostrich");
+
             const MAX_LEN: usize = 160;
             let trimmed_content = if ev.content.len() > MAX_LEN {
                 &ev.content[..MAX_LEN]
@@ -334,12 +340,12 @@ async fn get_event_tags(
 
             let image = profile
                 .as_ref()
-                .and_then(|p| p.picture.clone())
+                .and_then(|p| p.profile.picture.clone())
                 .unwrap_or_else(|| default_avatar(&ev.pubkey.to_hex()));
 
             let profile_name = profile
                 .as_ref()
-                .and_then(|p| p.name.as_deref())
+                .and_then(|p| p.profile.name.as_deref())
                 .unwrap_or("");
 
             let created_iso = DateTime::from_timestamp(ev.created_at.as_u64() as i64, 0)
@@ -379,26 +385,15 @@ async fn get_event_tags(
     tags
 }
 
-async fn get_profile_event(
-    fetch: &State<FetchQueue>,
-    pubkey: &PublicKey,
-) -> Option<nostr_sdk::Metadata> {
-    let nip19 = Nip19::Event(Nip19Event {
-        event_id: EventId::all_zeros(),
-        author: Some(*pubkey),
-        kind: Some(Kind::Metadata),
-        relays: vec![],
-    });
-
-    let ev = match fetch.demand(&nip19).await {
-        Ok(e) => e,
-        _ => None,
-    };
-    ev.and_then(|e| nostr_sdk::Metadata::from_json(&e.content).ok())
-}
-
 async fn get_profile_meta(fetch: &State<FetchQueue>, pubkey: &PublicKey) -> Option<ProfileMeta> {
-    let profile = get_profile_event(fetch, pubkey).await?;
+    let profile = match fetch.get_profile(pubkey.clone()).await {
+        Ok(Some(profile)) => profile,
+        Ok(None) => return None,
+        Err(e) => {
+            warn!("Failed to get profile: {}", e);
+            return None;
+        }
+    };
 
     let name = profile.name.as_deref().unwrap_or("Nostrich");
     let title = format!("{}'s Profile", name);
@@ -410,12 +405,17 @@ async fn get_profile_meta(fetch: &State<FetchQueue>, pubkey: &PublicKey) -> Opti
         about
     };
 
-    let picture = profile.picture.unwrap_or(default_avatar(&pubkey.to_hex()));
+    let picture = profile
+        .picture
+        .as_ref()
+        .map(|p| p.to_string())
+        .unwrap_or(default_avatar(&pubkey.to_hex()));
 
     Some(ProfileMeta {
         title,
         description: description.to_string(),
-        image: picture.to_string(),
+        image: picture,
+        profile,
     })
 }
 

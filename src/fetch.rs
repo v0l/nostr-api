@@ -1,7 +1,8 @@
 use anyhow::Result;
+use moka::future::Cache;
 use nostr_sdk::filter::MatchEventOptions;
 use nostr_sdk::prelude::{Events, Nip19};
-use nostr_sdk::{Client, Event, EventId, Filter, Kind, serde_json};
+use nostr_sdk::{Client, Event, EventId, Filter, JsonUtil, Kind, Metadata, PublicKey, serde_json};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,6 +17,7 @@ struct QueueItem {
 pub struct FetchQueue {
     queue: Arc<Mutex<VecDeque<QueueItem>>>,
     client: Client,
+    profile_cache: Cache<PublicKey, Option<Metadata>>,
 }
 
 impl FetchQueue {
@@ -23,11 +25,27 @@ impl FetchQueue {
         Self {
             queue: Arc::new(Mutex::new(VecDeque::new())),
             client,
+            profile_cache: Cache::builder()
+                .time_to_live(Duration::from_secs(24 * 60 * 60)) // 1 day
+                .build(),
         }
     }
 
     pub fn client(&self) -> Client {
         self.client.clone()
+    }
+
+    pub async fn get_profile(&self, pubkey: PublicKey) -> Result<Option<Metadata>> {
+        if let Some(r) = self.profile_cache.get(&pubkey).await {
+            Ok(r)
+        } else {
+            let p = self
+                .demand(&Nip19::Pubkey(pubkey))
+                .await?;
+            let p = p.and_then(|x| Metadata::from_json(x.content).ok());
+            self.profile_cache.insert(pubkey, p.clone()).await;
+            Ok(p)
+        }
     }
 
     pub async fn demand(&self, ent: &Nip19) -> Result<Option<Event>> {
