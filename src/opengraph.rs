@@ -410,7 +410,7 @@ fn inject_tags(html: &str, tags: Vec<HeadElement>) -> String {
         }
 
         // Insert tags at the beginning of <head>
-        if let Some(head_start) = html_string.find("<head ") {
+        if let Some(head_start) = html_string.find("<head") {
             if let Some(head_end) = html_string[head_start..].find('>') {
                 let insert_pos = head_start + head_end + 1;
                 html_string.insert_str(insert_pos, &format!("\n{}", injected_tags));
