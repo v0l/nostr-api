@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1.38.1", features = ["rt", "rt-multi-thread", "macros"] }
-nostr-sdk = { version = "0.43.0", features = ["ndb"] }
+nostr-sdk = { version = "0.43.0" }
 rocket = { version = "0.5.1", features = ["json"] }
 serde = { version = "1.0.204", features = ["derive"] }
 log = "0.4.22"

@@ -18,6 +18,7 @@ pub struct FetchQueue {
     queue: Arc<Mutex<VecDeque<QueueItem>>>,
     client: Client,
     profile_cache: Cache<PublicKey, Option<Metadata>>,
+    event_cache: Cache<String, Event>,
 }
 
 impl FetchQueue {
@@ -28,6 +29,9 @@ impl FetchQueue {
             profile_cache: Cache::builder()
                 .time_to_live(Duration::from_secs(24 * 60 * 60)) // 1 day
                 .build(),
+            event_cache: Cache::builder()
+                .time_to_live(Duration::from_secs(60 * 10)) // 10 mins
+                .build(),
         }
     }
 
@@ -35,13 +39,27 @@ impl FetchQueue {
         self.client.clone()
     }
 
+    fn n19_key(n19: &Nip19) -> Option<String> {
+        match n19 {
+            Nip19::Pubkey(p) => Some(p.to_hex()),
+            Nip19::Profile(p) => Some(p.public_key.to_hex()),
+            Nip19::EventId(i) => Some(i.to_hex()),
+            Nip19::Event(i) => Some(i.event_id.to_hex()),
+            Nip19::Coordinate(c) => Some(format!(
+                "{}:{}:{}",
+                c.kind,
+                c.public_key.to_hex(),
+                c.coordinate
+            )),
+            _ => None,
+        }
+    }
+
     pub async fn get_profile(&self, pubkey: PublicKey) -> Result<Option<Metadata>> {
         if let Some(r) = self.profile_cache.get(&pubkey).await {
             Ok(r)
         } else {
-            let p = self
-                .demand(&Nip19::Pubkey(pubkey))
-                .await?;
+            let p = self.demand(&Nip19::Pubkey(pubkey)).await?;
             let p = p.and_then(|x| Metadata::from_json(x.content).ok());
             self.profile_cache.insert(pubkey, p.clone()).await;
             Ok(p)
@@ -49,6 +67,13 @@ impl FetchQueue {
     }
 
     pub async fn demand(&self, ent: &Nip19) -> Result<Option<Event>> {
+        let cache_key = Self::n19_key(ent);
+        if let Some(cc) = &cache_key
+            && let Some(cached) = self.event_cache.get(cc).await
+        {
+            return Ok(Some(cached.clone()));
+        }
+
         let (tx, rx) = oneshot::channel();
 
         {
@@ -58,8 +83,16 @@ impl FetchQueue {
                 request: ent.clone(),
             });
         }
-        rx.await
-            .map_err(|e| anyhow::anyhow!("Failed to demand {}", e))
+        let res = rx
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to demand {}", e))?;
+
+        if let Some(r) = &res
+            && let Some(cc) = cache_key
+        {
+            self.event_cache.insert(cc, r.clone()).await;
+        }
+        Ok(res)
     }
 
     pub async fn process_queue(&self) {
