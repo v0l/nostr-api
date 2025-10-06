@@ -7,7 +7,7 @@ use nostr_sdk::{
     Alphabet, Event, FromBech32, Kind, Metadata, PublicKey, SingleLetterTag, TagKind, ToBech32,
 };
 use rocket::data::ByteUnit;
-use rocket::http::Status;
+use rocket::http::{ContentType, Status};
 use rocket::{Data, Route, State};
 use scraper::{ElementRef, Html, Selector};
 use std::collections::HashSet;
@@ -119,13 +119,13 @@ struct ProfileMeta {
 }
 
 /// Inject opengraph tags into provided html
-#[post("/opengraph/<id>?<canonical>", data = "<body>")]
+#[post("/opengraph/<id>?<canonical>", data = "<body>", format = "text/html")]
 async fn tag_page(
     fetch: &State<FetchQueue>,
     id: &str,
     canonical: Option<&str>,
     body: Data<'_>,
-) -> Result<(Status, String), Status> {
+) -> Result<(ContentType, String), Status> {
     let stream = body.open(ByteUnit::Mebibyte(64));
     let html = stream.into_string().await.map_err(|e| {
         warn!("Failed to read request body: {}", e);
@@ -140,7 +140,7 @@ async fn tag_page(
 
     let nid = match Nip19::from_bech32(id) {
         Ok(n) => n,
-        Err(_) => return Ok((Status::Ok, html)),
+        Err(_) => return Ok((ContentType::HTML, html)),
     };
 
     let tags = match &nid {
@@ -158,7 +158,7 @@ async fn tag_page(
             let pk = match &nid {
                 Nip19::Pubkey(p) => *p,
                 Nip19::Profile(np) => np.public_key,
-                _ => return Ok((Status::Ok, html)),
+                _ => return Ok((ContentType::HTML, html)),
             };
 
             let profile_meta = get_profile_meta(fetch, &pk).await;
@@ -191,11 +191,11 @@ async fn tag_page(
     };
 
     if tags.is_empty() {
-        Ok((Status::Ok, html))
+        Ok((ContentType::HTML, html))
     } else {
         info!("Injecting {} tags for {}", tags.len(), id);
         let result_html = inject_tags(&html, tags);
-        Ok((Status::Ok, result_html))
+        Ok((ContentType::HTML, result_html))
     }
 }
 

@@ -5,14 +5,16 @@ use crate::fetch::FetchQueue;
 use crate::settings::Settings;
 use anyhow::Result;
 use config::Config;
-use nostr_sdk::{ClientBuilder};
-use rocket::http::ContentType;
+use nostr_sdk::ClientBuilder;
+use rocket::http::{ContentType, Method};
 use rocket::shield::Shield;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
+use crate::cors::CORS;
 
 mod avatar;
+mod cors;
 mod events;
 mod fetch;
 mod link_preview;
@@ -58,12 +60,22 @@ async fn main() -> Result<()> {
     rocket::Rocket::custom(config)
         .manage(fetch)
         .manage(link_preview_cache)
+        .attach(CORS)
         .attach(Shield::new()) // disable
         .mount("/", avatar::routes())
         .mount("/", events::routes())
         .mount("/", opengraph::routes())
         .mount("/", link_preview::routes())
         .mount("/", routes![index, openapi])
+        .mount(
+            "/",
+            vec![rocket::Route::ranked(
+                isize::MAX,
+                Method::Options,
+                "/<catch_all_options_route..>",
+                CORS,
+            )],
+        )
         .launch()
         .await?;
 
