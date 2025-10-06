@@ -6,7 +6,7 @@ use crate::settings::Settings;
 use anyhow::Result;
 use config::Config;
 use nostr_sdk::prelude::NostrDatabase;
-use nostr_sdk::{ClientBuilder, NdbDatabase};
+use nostr_sdk::{ClientBuilder, Filter, NdbDatabase};
 use rocket::http::ContentType;
 use rocket::shield::Shield;
 use std::net::{IpAddr, SocketAddr};
@@ -31,7 +31,12 @@ async fn main() -> Result<()> {
 
     let settings: Settings = builder.try_deserialize()?;
 
-    let db: Arc<dyn NostrDatabase> = Arc::new(NdbDatabase::open("db")?);
+    let db = NdbDatabase::open("db")?;
+    while db.query(Filter::new().limit(1)).await.is_err() {
+        info!("Waiting for db to be ready...");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    let db: Arc<dyn NostrDatabase> = Arc::new(db);
     let client = ClientBuilder::new().database(db.clone()).build();
     for x in settings.relays {
         client.add_relay(x).await?;
