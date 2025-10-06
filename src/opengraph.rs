@@ -401,11 +401,7 @@ async fn get_event_tags(
                 .unwrap_or("Nostrich");
 
             const MAX_LEN: usize = 160;
-            let trimmed_content = if ev.content.len() > MAX_LEN {
-                &ev.content[..MAX_LEN]
-            } else {
-                &ev.content
-            };
+            let trimmed_content = ev.content.chars().take(MAX_LEN).collect::<String>();
             let title_content = format!("{}: {}", name, trimmed_content);
 
             let image = profile
@@ -469,11 +465,7 @@ async fn get_profile_meta(fetch: &State<FetchQueue>, pubkey: &PublicKey) -> Opti
     let title = format!("{}'s Profile", name);
 
     let about = profile.about.as_deref().unwrap_or("");
-    let description = if about.len() > 160 {
-        &about[..160]
-    } else {
-        about
-    };
+    let description = about.chars().take(160).collect::<String>();
 
     let picture = profile
         .picture
