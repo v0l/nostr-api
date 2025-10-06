@@ -10,6 +10,8 @@ use rocket::data::ByteUnit;
 use rocket::http::{ContentType, Status};
 use rocket::{Data, Route, State};
 use scraper::{ElementRef, Html, Selector};
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 
@@ -118,6 +120,60 @@ struct ProfileMeta {
     profile: Metadata,
 }
 
+#[derive(Deserialize)]
+struct Nip05Response {
+    names: HashMap<String, String>,
+}
+
+/// Parse and validate NIP-05 identifier (name@domain.tld)
+fn parse_nip05(identifier: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = identifier.split('@').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+
+    let name = parts[0];
+    let domain = parts[1];
+
+    // Validate name: only a-z0-9-_.
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' || c == '.')
+    {
+        return None;
+    }
+
+    // Basic domain validation
+    if domain.is_empty() || !domain.contains('.') {
+        return None;
+    }
+
+    Some((name.to_lowercase(), domain.to_lowercase()))
+}
+
+/// Resolve NIP-05 identifier to public key
+async fn resolve_nip05(identifier: &str) -> Option<PublicKey> {
+    let (name, domain) = parse_nip05(identifier)?;
+
+    let url = format!("https://{}/.well-known/nostr.json?name={}", domain, name);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+
+    let response = client.get(&url).send().await.ok()?;
+
+    if !response.status().is_success() {
+        return None;
+    }
+
+    let nip05_data: Nip05Response = response.json().await.ok()?;
+
+    let pubkey_hex = nip05_data.names.get(&name)?;
+    PublicKey::from_hex(pubkey_hex).ok()
+}
+
 /// Inject opengraph tags into provided html
 #[post("/opengraph/<id>?<canonical>", data = "<body>", format = "text/html")]
 async fn tag_page(
@@ -126,7 +182,7 @@ async fn tag_page(
     canonical: Option<&str>,
     body: Data<'_>,
 ) -> Result<(ContentType, String), Status> {
-    let stream = body.open(ByteUnit::Mebibyte(64));
+    let stream = body.open(ByteUnit::Mebibyte(1));
     let html = stream.into_string().await.map_err(|e| {
         warn!("Failed to read request body: {}", e);
         Status::InternalServerError
@@ -138,9 +194,23 @@ async fn tag_page(
         return Err(Status::InternalServerError);
     };
 
+    // Try parsing as Nip19 first, then fall back to NIP-05
     let nid = match Nip19::from_bech32(id) {
-        Ok(n) => n,
-        Err(_) => return Ok((ContentType::HTML, html)),
+        Ok(n) => Some(n),
+        Err(_) => {
+            // Try NIP-05 resolution
+            if let Some(pubkey) = resolve_nip05(id).await {
+                info!("Resolved NIP-05 {} to {}", id, pubkey.to_hex());
+                Some(Nip19::Pubkey(pubkey))
+            } else {
+                None
+            }
+        }
+    };
+
+    let nid = match nid {
+        Some(n) => n,
+        None => return Ok((ContentType::HTML, html)),
     };
 
     let tags = match &nid {
