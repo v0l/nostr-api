@@ -1,11 +1,11 @@
+use anyhow::Result;
+use nostr_sdk::filter::MatchEventOptions;
+use nostr_sdk::prelude::{Events, Nip19};
+use nostr_sdk::{Client, Event, EventId, Filter, Kind, serde_json};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
-
-use nostr::prelude::Nip19;
-use nostr::{serde_json, Event, EventId, Filter, Kind, Url};
-use nostr_sdk::{FilterOptions, RelayOptions, RelayPool};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, oneshot};
 
 struct QueueItem {
     pub handler: oneshot::Sender<Option<Event>>,
@@ -15,38 +15,33 @@ struct QueueItem {
 #[derive(Clone)]
 pub struct FetchQueue {
     queue: Arc<Mutex<VecDeque<QueueItem>>>,
-    pool: Arc<Mutex<RelayPool>>,
+    client: Client,
 }
 
 impl FetchQueue {
-    pub fn new() -> Self {
+    pub fn new(client: Client) -> Self {
         Self {
             queue: Arc::new(Mutex::new(VecDeque::new())),
-            pool: Default::default(),
+            client,
         }
     }
 
-    pub async fn add_relay(&mut self, relay: Url) -> Result<bool, anyhow::Error> {
-        let pool_lock = self.pool.lock().await;
-        pool_lock
-            .add_relay(relay.clone(), RelayOptions::default())
-            .await?;
-        if let Err(e) = pool_lock.connect_relay(relay, None).await {
-            Err(anyhow::Error::new(e))
-        } else {
-            Ok(true)
-        }
+    pub fn client(&self) -> Client {
+        self.client.clone()
     }
 
-    pub async fn demand(&mut self, ent: &Nip19) -> oneshot::Receiver<Option<Event>> {
+    pub async fn demand(&self, ent: &Nip19) -> Result<Option<Event>> {
         let (tx, rx) = oneshot::channel();
 
-        let mut q_lock = self.queue.lock().await;
-        q_lock.push_back(QueueItem {
-            handler: tx,
-            request: ent.clone(),
-        });
-        rx
+        {
+            let mut q_lock = self.queue.lock().await;
+            q_lock.push_back(QueueItem {
+                handler: tx,
+                request: ent.clone(),
+            });
+        }
+        rx.await
+            .map_err(|e| anyhow::anyhow!("Failed to demand {}", e))
     }
 
     pub async fn process_queue(&self) {
@@ -56,27 +51,50 @@ impl FetchQueue {
             batch.push(q);
         }
         if batch.len() > 0 {
-            let filters: Vec<Filter> =
-                batch.iter().map(move |x| Self::nip19_to_filter(&x.request).unwrap()).collect();
+            let filters: Vec<Filter> = batch
+                .iter()
+                .map(move |x| Self::nip19_to_filter(&x.request).unwrap())
+                .collect();
 
-            let pool_lock = self.pool.lock().await;
-            info!("Sending filters: {}", serde_json::to_string(&filters).unwrap());
-            if let Ok(evs) = pool_lock
-                .get_events_of(filters, Duration::from_secs(2), FilterOptions::ExitOnEOSE)
-                .await
-            {
-                for b in batch {
-                    let f = Self::nip19_to_filter(&b.request).unwrap();
-                    let ev = evs.iter().find(|e| f.match_event(e));
-                    b.handler.send(ev.cloned()).unwrap()
+            info!(
+                "Sending filters: {}",
+                serde_json::to_string(&filters).unwrap()
+            );
+            let mut all_events = Events::default();
+            for filter in filters {
+                match self
+                    .client
+                    .fetch_events(filter, Duration::from_secs(2))
+                    .await
+                {
+                    Ok(events) => {
+                        events.into_iter().for_each(|e| {
+                            all_events.insert(e);
+                        });
+                    }
+                    Err(e) => {
+                        warn!("Failed to fetch events: {}", e);
+                    }
                 }
+            }
+            for b in batch {
+                let f = Self::nip19_to_filter(&b.request).unwrap();
+                let ev = all_events
+                    .iter()
+                    .find(|e| f.match_event(e, MatchEventOptions::new()));
+                b.handler.send(ev.cloned()).unwrap()
             }
         }
     }
 
-    fn nip19_to_filter(filter: &Nip19) -> Option<Filter> {
-        match filter {
-            Nip19::Coordinate(c) => Some(Filter::from(c)),
+    fn nip19_to_filter(nip19: &Nip19) -> Option<Filter> {
+        match nip19.clone() {
+            Nip19::Coordinate(c) => Some(
+                Filter::new()
+                    .author(c.public_key)
+                    .kind(c.kind)
+                    .identifier(&c.identifier),
+            ),
             Nip19::Event(e) => {
                 let mut f = Filter::new();
                 if e.event_id.ne(&EventId::all_zeros()) {
@@ -90,8 +108,8 @@ impl FetchQueue {
                 }
                 Some(f)
             }
-            Nip19::EventId(e) => Some(Filter::new().id(*e)),
-            Nip19::Pubkey(pk) => Some(Filter::new().author(*pk).kind(Kind::Metadata)),
+            Nip19::EventId(e) => Some(Filter::new().id(e)),
+            Nip19::Pubkey(pk) => Some(Filter::new().author(pk).kind(Kind::Metadata)),
             _ => None,
         }
     }

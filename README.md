@@ -2,13 +2,25 @@
 
 Simple API for serving nostr applications
 
-## API
+## API Documentation
 
-### `POST /event`
-Save event in database
+Interactive API documentation is available at `/` when running the server.
 
-### `GET /event/<event-id>`
-Get event by ID as `hex/nevent/naddr`
+OpenAPI specification: `/openapi.yaml`
 
-### `GET /event/<kind>/<pubkey>`
-Get regular replaceable event for pubkey (non-parameterized)
+## Endpoints
+
+### Event Management
+
+- `POST /event` - Import a Nostr event into the database
+- `GET /event/{id}` - Get event by NIP-19 identifier (note1.../nevent1.../naddr1...)
+- `GET /event/{kind}/{pubkey}` - Get replaceable event by kind and pubkey
+
+### Link Previews
+
+- `GET /preview?url={url}` - Fetch OpenGraph tags and metadata from a URL
+- `POST /opengraph/{id}?canonical={template}` - Inject OpenGraph tags into HTML for Nostr events/profiles
+
+### Avatars
+
+- `GET /avatar/{set}/{value}` - Get deterministic avatar from set (cyberpunks/robots/zombies)

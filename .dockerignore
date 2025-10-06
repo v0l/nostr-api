@@ -1,0 +1,7 @@
+target/
+db/
+.idea/
+README.md
+Dockerfile
+.gitignore
+.drone.yml

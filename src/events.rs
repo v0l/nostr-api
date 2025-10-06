@@ -1,25 +1,30 @@
-use nostr::{Event, EventId, FromBech32, Kind, PublicKey};
-use nostr::prelude::{Nip19, Nip19Event};
-use rocket::{Route, State};
+use anyhow::Result;
+use nostr_sdk::prelude::{Nip19, Nip19Event, RejectedReason, SaveEventStatus};
+use nostr_sdk::{Event, EventId, FromBech32, Kind, PublicKey};
 use rocket::http::Status;
 use rocket::serde::json::Json;
+use rocket::{Route, State};
 
 use crate::fetch::FetchQueue;
-use crate::store::SledDatabase;
 
 pub fn routes() -> Vec<Route> {
     routes![import_event, get_event, get_event_by_kind]
 }
 
 #[rocket::post("/event", data = "<data>")]
-async fn import_event(db: &State<SledDatabase>, data: Json<Event>) -> Status {
+async fn import_event(fetch: &State<FetchQueue>, data: Json<Event>) -> Status {
     if data.verify().is_err() {
         return Status::InternalServerError;
     }
+    let client = fetch.client();
+    let db = client.database();
     if let Ok(v) = db.save_event(&data).await {
         match v {
-            true => Status::Ok,
-            false => Status::Conflict,
+            SaveEventStatus::Success => Status::Ok,
+            SaveEventStatus::Rejected(r) => match r {
+                RejectedReason::Duplicate => Status::Conflict,
+                _ => Status::InternalServerError,
+            },
         }
     } else {
         Status::InternalServerError
@@ -27,64 +32,42 @@ async fn import_event(db: &State<SledDatabase>, data: Json<Event>) -> Status {
 }
 
 #[rocket::get("/event/<id>")]
-async fn get_event(
-    db: &State<SledDatabase>,
-    fetch: &State<FetchQueue>,
-    id: &str,
-) -> Option<Json<Event>> {
-    let id = match Nip19::from_bech32(id) {
-        Ok(i) => i,
-        _ => return None,
-    };
-    match db.event_by_id(&id) {
-        Ok(ev) => Some(Json::from(ev)),
-        _ => {
-            let mut fetch = fetch.inner().clone();
-            match fetch.demand(&id).await.await {
-                Ok(Some(ev)) => {
-                    if let Err(e) = db.save_event(&ev).await {
-                        warn!("Failed to save event {}", e);
-                    }
-                    Some(Json::from(ev))
-                }
-                _ => None,
-            }
-        }
-    }
+async fn get_event(fetch: &State<FetchQueue>, id: &str) -> Result<Option<Json<Event>>, Status> {
+    let id = Nip19::from_bech32(id).map_err(|_| Status::InternalServerError)?;
+    Ok(fetch
+        .demand(&id)
+        .await
+        .map_err(|e| {
+            error!("Failed get_event {}", e);
+            Status::InternalServerError
+        })?
+        .map(|r| Json::from(r)))
 }
 
 #[rocket::get("/event/<kind>/<pubkey>")]
 async fn get_event_by_kind(
-    db: &State<SledDatabase>,
     fetch: &State<FetchQueue>,
-    kind: u32, pubkey: &str,
-) -> Option<Json<Event>> {
-    let pk = match PublicKey::parse(pubkey) {
-        Ok(i) => i,
-        _ => return None,
-    };
+    kind: u32,
+    pubkey: &str,
+) -> Result<Option<Json<Event>>, Status> {
+    let pk = PublicKey::parse(pubkey).map_err(|_| Status::InternalServerError)?;
     let kind = Kind::from(kind as u16);
     if !kind.is_replaceable() {
-        return None;
+        return Ok(None);
     }
-    match db.event_by_kind_pubkey(kind.as_u32(), &pk) {
-        Ok(ev) => Some(Json::from(ev)),
-        _ => {
-            let mut fetch = fetch.inner().clone();
-            match fetch.demand(&Nip19::Event(Nip19Event {
-                event_id: EventId::all_zeros(),
-                kind: Some(kind),
-                author: Some(pk),
-                relays: vec![],
-            })).await.await {
-                Ok(Some(ev)) => {
-                    if let Err(e) = db.save_event(&ev).await {
-                        warn!("Failed to save event {}", e);
-                    }
-                    Some(Json::from(ev))
-                }
-                _ => None
-            }
-        }
-    }
+
+    let id = Nip19::Event(Nip19Event {
+        event_id: EventId::all_zeros(),
+        kind: Some(kind),
+        author: Some(pk),
+        relays: vec![],
+    });
+    Ok(fetch
+        .demand(&id)
+        .await
+        .map_err(|e| {
+            error!("Failed get_event_by_kind {}", e);
+            Status::InternalServerError
+        })?
+        .map(|r| Json::from(r)))
 }

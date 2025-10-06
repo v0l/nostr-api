@@ -1,70 +1,93 @@
 #[macro_use]
 extern crate rocket;
 
-use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
-
-use anyhow::Error;
-use config::Config;
-use rocket::shield::Shield;
-
 use crate::fetch::FetchQueue;
 use crate::settings::Settings;
-use crate::store::SledDatabase;
+use anyhow::Result;
+use config::Config;
+use nostr_sdk::prelude::NostrDatabase;
+use nostr_sdk::{ClientBuilder, NdbDatabase};
+use rocket::http::ContentType;
+use rocket::shield::Shield;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::time::Duration;
 
+mod avatar;
 mod events;
 mod fetch;
-mod store;
+mod link_preview;
+mod opengraph;
 mod settings;
 
 #[rocket::main]
-async fn main() -> Result<(), Error> {
-    pretty_env_logger::init();
+async fn main() -> Result<()> {
+    env_logger::init();
 
     let builder = Config::builder()
-        .add_source(config::File::with_name("config.toml"))
+        .add_source(config::File::with_name("config.yaml"))
         .add_source(config::Environment::with_prefix("APP"))
         .build()?;
 
     let settings: Settings = builder.try_deserialize()?;
 
-    let db = SledDatabase::new("nostr.db");
-
-    let mut fetch = FetchQueue::new();
-    for x in settings.relays
-    {
-        fetch.add_relay(x).await.unwrap();
+    let db: Arc<dyn NostrDatabase> = Arc::new(NdbDatabase::open("db")?);
+    let client = ClientBuilder::new().database(db.clone()).build();
+    for x in settings.relays {
+        client.add_relay(x).await?;
     }
+    client.connect().await;
 
-
-    let fetch2 = fetch.clone();
+    let fetch = FetchQueue::new(client.clone());
+    let fetch_worker = fetch.clone();
     tokio::spawn(async move {
         loop {
-            fetch2.process_queue().await;
+            fetch_worker.process_queue().await;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     });
 
+    let link_preview_cache = Arc::new(link_preview::LinkPreviewCache::new());
+
     let mut config = rocket::Config::default();
     let ip: SocketAddr = match &settings.listen {
         Some(i) => i.parse().unwrap(),
-        None => SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 8000)
+        None => SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 8000),
     };
     config.address = ip.ip();
     config.port = ip.port();
 
-    let rocket = rocket::Rocket::custom(config)
-        .manage(db)
+    rocket::Rocket::custom(config)
         .manage(fetch)
+        .manage(link_preview_cache)
         .attach(Shield::new()) // disable
+        .mount("/", avatar::routes())
         .mount("/", events::routes())
+        .mount("/", opengraph::routes())
+        .mount("/", link_preview::routes())
+        .mount("/", routes![index, openapi])
         .launch()
-        .await;
+        .await?;
 
-    if let Err(e) = rocket {
-        error!("Rocker error {}", e);
-        Err(Error::from(e))
-    } else {
-        Ok(())
-    }
+    Ok(())
+}
+
+pub fn default_avatar(hash: &str) -> String {
+    format!(
+        "https://nostr-api.v0l.io/api/v1/avatar/cyberpunks/{}.webp",
+        hash
+    )
+}
+
+#[get("/")]
+pub fn index() -> (ContentType, &'static str) {
+    (ContentType::HTML, include_str!("../index.html"))
+}
+
+#[get("/openapi.yaml")]
+pub fn openapi() -> (ContentType, &'static str) {
+    (
+        ContentType::new("text", "yaml"),
+        include_str!("../openapi.yaml"),
+    )
 }

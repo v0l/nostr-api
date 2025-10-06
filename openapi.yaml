@@ -1,0 +1,277 @@
+openapi: 3.0.3
+info:
+  title: Nostr Services API
+  description: REST API for Nostr event storage and retrieval with OpenGraph support
+  version: 1.0.0
+servers:
+  - url: http://localhost:8000
+    description: Local development server
+  - url: https://nostr-rs-api.v0l.io
+    description: Production server
+
+paths:
+  /event:
+    post:
+      summary: Import a Nostr event
+      description: Import a Nostr event into the database. The event must be properly signed and verified before storage.
+      operationId: importEvent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NostrEvent'
+            example:
+              id: "abc123..."
+              pubkey: "def456..."
+              created_at: 1234567890
+              kind: 1
+              tags: [ ]
+              content: "Hello, Nostr!"
+              sig: "ghi789..."
+      responses:
+        '200':
+          description: Event successfully stored
+        '409':
+          description: Event already exists
+        '500':
+          description: Event verification failed or storage error
+
+  /event/{id}:
+    get:
+      summary: Get event by ID
+      description: Retrieve a Nostr event by its NIP-19 identifier. The event will be fetched from configured relays on demand.
+      operationId: getEvent
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: NIP-19 encoded event identifier (e.g., note1..., nevent1..., naddr1...)
+          schema:
+            type: string
+          example: "note1..."
+      responses:
+        '200':
+          description: Event found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NostrEvent'
+        '204':
+          description: Event not found
+        '500':
+          description: Failed to fetch event
+
+  /event/{kind}/{pubkey}:
+    get:
+      summary: Get replaceable event by kind and pubkey
+      description: Retrieve a replaceable event by kind and public key. This endpoint only works with replaceable event kinds (10000-19999, 30000-39999). The event will be fetched from configured relays on demand.
+      operationId: getEventByKind
+      parameters:
+        - name: kind
+          in: path
+          required: true
+          description: Event kind number (must be replaceable)
+          schema:
+            type: integer
+            format: uint32
+          example: 0
+        - name: pubkey
+          in: path
+          required: true
+          description: Public key in hex format
+          schema:
+            type: string
+          example: "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d"
+      responses:
+        '200':
+          description: Most recent replaceable event found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NostrEvent'
+        '204':
+          description: Event not found or kind is not replaceable
+        '500':
+          description: Failed to fetch event
+
+  /avatar/{set}/{value}:
+    get:
+      summary: Get deterministic avatar
+      description: Get a deterministic avatar image based on input value. The value is hashed to select an image from the specified set. Results are cached for 24 hours.
+      operationId: getAvatar
+      parameters:
+        - name: set
+          in: path
+          required: true
+          description: Avatar set name
+          schema:
+            type: string
+            enum: [ cyberpunks, robots, zombies ]
+          example: "cyberpunks"
+        - name: value
+          in: path
+          required: true
+          description: Any value to hash (file extension will be ignored)
+          schema:
+            type: string
+          example: "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d"
+      responses:
+        '200':
+          description: Avatar image
+          content:
+            image/webp:
+              schema:
+                type: string
+                format: binary
+        '404':
+          description: Set not found or no images available
+
+  /preview:
+    get:
+      summary: Get link preview
+      description: Fetch and parse a web page to extract OpenGraph tags, title, description, and image. Results are cached for 7 days. Failed attempts are cached for 10 minutes to avoid repeated requests.
+      operationId: getLinkPreview
+      parameters:
+        - name: url
+          in: query
+          required: true
+          description: URL of the web page to fetch and parse
+          schema:
+            type: string
+            format: uri
+          example: "https://example.com/article"
+      responses:
+        '200':
+          description: Successfully fetched and parsed link preview
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LinkPreviewData'
+        '404':
+          description: Failed to fetch page or page is not HTML
+        '500':
+          description: Internal server error
+
+  /opengraph/{id}:
+    post:
+      summary: Inject OpenGraph tags
+      description: Inject OpenGraph meta tags into HTML for Nostr events and profiles. This endpoint fetches events and profiles on demand from configured relays to generate rich social media previews.
+      operationId: injectOpenGraph
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: NIP-19 encoded identifier (note1..., nevent1..., naddr1..., npub1..., nprofile1...)
+          schema:
+            type: string
+          example: "note1..."
+        - name: canonical
+          in: query
+          required: false
+          description: URL template for canonical link. Use %s as placeholder for the bech32 ID. For addressable events, uses naddr format.
+          schema:
+            type: string
+          example: "https://example.com/%s"
+      requestBody:
+        required: true
+        description: HTML document to inject meta tags into (max 64 MiB)
+        content:
+          text/html:
+            schema:
+              type: string
+            example: |
+              <!DOCTYPE html>
+              <html>
+              <head>
+              </head>
+              <body>
+              <div id="root"></div>
+              </body>
+              </html>
+      responses:
+        '200':
+          description: HTML with injected OpenGraph tags (or unchanged if event not found)
+          content:
+            text/html:
+              schema:
+                type: string
+        '500':
+          description: Request body too large, malformed, or failed to fetch event
+
+components:
+  schemas:
+    NostrEvent:
+      type: object
+      required:
+        - id
+        - pubkey
+        - created_at
+        - kind
+        - tags
+        - content
+        - sig
+      properties:
+        id:
+          type: string
+          description: Event ID (32-byte hex string)
+          example: "abc123..."
+        pubkey:
+          type: string
+          description: Public key (32-byte hex string)
+          example: "def456..."
+        created_at:
+          type: integer
+          format: int64
+          description: Unix timestamp
+          example: 1234567890
+        kind:
+          type: integer
+          format: uint16
+          description: Event kind
+          example: 1
+        tags:
+          type: array
+          description: Array of tags
+          items:
+            type: array
+            items:
+              type: string
+          example: [ [ "e", "event_id" ], [ "p", "pubkey" ] ]
+        content:
+          type: string
+          description: Event content
+          example: "Hello, Nostr!"
+        sig:
+          type: string
+          description: Schnorr signature (64-byte hex string)
+          example: "ghi789..."
+
+    LinkPreviewData:
+      type: object
+      properties:
+        ogTags:
+          type: array
+          description: Array of OpenGraph tag key-value pairs
+          items:
+            type: array
+            items:
+              type: string
+            minItems: 2
+            maxItems: 2
+          example: [ [ "og:title", "Example Title" ], [ "og:description", "Example description" ], [ "og:image", "https://example.com/image.jpg" ] ]
+        title:
+          type: string
+          description: Page title (from og:title or <title> tag)
+          example: "Example Title"
+          nullable: true
+        description:
+          type: string
+          description: Page description (from og:description or meta description)
+          example: "This is an example page description"
+          nullable: true
+        image:
+          type: string
+          description: Primary image URL (from og:image)
+          example: "https://example.com/image.jpg"
+          nullable: true
