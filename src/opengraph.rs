@@ -11,13 +11,14 @@ use rocket::data::ByteUnit;
 use rocket::http::Status;
 use rocket::{Data, Route, State};
 use scraper::{ElementRef, Html, Selector};
+use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 
 pub fn routes() -> Vec<Route> {
     routes![tag_page]
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct HeadElement {
     element: String,
     attributes: Vec<(String, String)>,
@@ -217,7 +218,7 @@ async fn get_event_tags(
                 .iter()
                 .find(|t| {
                     let vec = t.as_slice();
-                    vec.len() > 3 && vec[0] == "p" && vec[3] == "host"
+                    vec[0] == "p" && vec.len() > 3 && vec[3].eq_ignore_ascii_case("host")
                 })
                 .and_then(|t| {
                     let vec = t.as_slice();
@@ -426,14 +427,22 @@ fn inject_tags(html: &str, tags: Vec<HeadElement>) -> String {
         let mut new_head_content = String::new();
 
         // Iterate through existing head children
+        let mut replaced = HashSet::new();
         for child in head_element.child_elements() {
             let replace_with = tags.iter().find_map(|t| t.replace_with(child));
             new_head_content.push('\n');
             if let Some(replace_with) = replace_with {
                 new_head_content.push_str(replace_with.to_string().as_str());
+                replaced.insert(replace_with);
             } else {
                 new_head_content.push_str(child.html().as_str());
             }
+        }
+
+        // add remaining tags
+        for tag in tags.into_iter().filter(|t| !replaced.contains(t)) {
+            new_head_content.push('\n');
+            new_head_content.push_str(tag.to_string().as_str());
         }
 
         // Replace the entire head element
