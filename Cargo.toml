@@ -4,18 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1.38.1", features = ["rt", "rt-multi-thread", "macros"] }
-nostr-sdk = { version = "0.43.0" }
-rocket = { version = "0.5.1", features = ["json"] }
-serde = { version = "1.0.204", features = ["derive"] }
-log = "0.4.22"
-env_logger = "0.11.8"
-anyhow = "1.0.86"
-config = { version = "0.15.18", features = ["yaml"] }
-hex = "0.4.3"
-scraper = "0.24.0"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+nostr-sdk = { version = "0.44" }
+rocket = { version = "0.5", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
+config = { version = "0.15", features = ["yaml"] }
+hex = "0.4"
+scraper = "0.25"
 chrono = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
 sha2 = "0.10"
 moka = { version = "0.12", features = ["future"] }
-serde_json = "1.0"
+serde_json = "1"
