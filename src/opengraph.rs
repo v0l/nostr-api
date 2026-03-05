@@ -2,10 +2,10 @@ use crate::default_avatar;
 use crate::fetch::FetchQueue;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::DateTime;
-use http::header;
 use nostr_sdk::nips::nip19::Nip19;
 use nostr_sdk::prelude::{Nip19Coordinate, Nip19Event};
 use nostr_sdk::{
@@ -217,10 +217,10 @@ pub async fn tag_page(
         Some(n) => n,
         None => {
             return (
-                [(header::CONTENT_TYPE, HeaderValue::from_static("text/html"))],
+                [(CONTENT_TYPE, HeaderValue::from_static("text/html"))],
                 html,
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -241,10 +241,10 @@ pub async fn tag_page(
                 Nip19::Profile(np) => np.public_key,
                 _ => {
                     return (
-                        [(header::CONTENT_TYPE, HeaderValue::from_static("text/html"))],
+                        [(CONTENT_TYPE, HeaderValue::from_static("text/html"))],
                         html,
                     )
-                        .into_response()
+                        .into_response();
                 }
             };
 
@@ -285,7 +285,7 @@ pub async fn tag_page(
     };
 
     (
-        [(header::CONTENT_TYPE, HeaderValue::from_static("text/html"))],
+        [(CONTENT_TYPE, HeaderValue::from_static("text/html"))],
         result_html,
     )
         .into_response()

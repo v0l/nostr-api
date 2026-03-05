@@ -1,10 +1,10 @@
+use axum::body::Body;
 use axum::extract::Path;
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use axum::body::Body;
-use http::header;
 
 pub async fn get_avatar(Path((set, value)): Path<(String, String)>) -> Response {
     // Validate set against allowlist to prevent path traversal
@@ -54,7 +54,7 @@ pub async fn get_avatar(Path((set, value)): Path<(String, String)>) -> Response 
     match tokio::fs::read(pick_img).await {
         Ok(bytes) => Response::builder()
             .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "image/webp")
+            .header(CONTENT_TYPE, "image/webp")
             .body(Body::from(bytes))
             .unwrap(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),

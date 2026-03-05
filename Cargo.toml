@@ -8,8 +8,6 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs"] }
 nostr-sdk = { version = "0.44" }
 axum = { version = "0.8", features = ["multipart"] }
 tower-http = { version = "0.6", features = ["cors", "fs"] }
-tower = { version = "0.5" }
-http = "1"
 serde = { version = "1", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"
@@ -18,7 +16,7 @@ config = { version = "0.15", features = ["yaml"] }
 hex = "0.4"
 scraper = "0.25"
 chrono = "0.4"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 sha2 = "0.10"
 moka = { version = "0.12", features = ["future"] }
 serde_json = "1"
