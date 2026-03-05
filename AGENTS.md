@@ -1,0 +1,43 @@
+# AGENTS.md - Coding Agent Guidelines for nostr_services_rs
+
+This file is an index. Load only the specific doc(s) relevant to your task to minimize context usage.
+
+**Always load [agents/common.md](agents/common.md) first** — it contains essential guidelines for task sizing, git commits, and git push that apply to all tasks.
+
+<!-- Uncomment and populate when you have active work files:
+| File | Description |
+|---|---|
+| [work/example-task.md](work/example-task.md) | Description of the task |
+-->
+
+## Generic Docs
+
+These docs apply to all projects using this agent structure:
+
+| Doc | When to load |
+|---|---|
+| [agents/bug-fixes.md](agents/bug-fixes.md) | Resolving bugs (includes regression test requirement) |
+| [agents/coverage.md](agents/coverage.md) | Any edit that adds or modifies functions (100% function coverage required) |
+| [agents/incremental-work.md](agents/incremental-work.md) | Managing a work file for a multi-increment task |
+
+### Language-Specific Docs
+
+Load the appropriate language-specific doc alongside the generic one:
+
+| Doc | When to load |
+|---|---|
+| [agents/rust/coverage.md](agents/rust/coverage.md) | Rust projects: coverage tooling commands |
+| [agents/typescript/coverage.md](agents/typescript/coverage.md) | TypeScript projects: coverage tooling commands |
+
+## Project-Specific Docs
+
+<!-- Add your project-specific docs here. Examples:
+
+| Doc | When to load |
+|---|---|
+| [agents/project-overview.md](agents/project-overview.md) | Understanding project structure, modules, feature flags |
+| [agents/build-and-test.md](agents/build-and-test.md) | Running builds, tests, linting, or formatting |
+| [agents/code-style.md](agents/code-style.md) | Writing or reviewing code (imports, errors, naming, etc.) |
+| [agents/api-guidelines.md](agents/api-guidelines.md) | Modifying any API endpoint |
+
+-->
