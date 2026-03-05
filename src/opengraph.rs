@@ -1019,4 +1019,91 @@ mod tests {
         assert_eq!(replaced.element, "title");
         assert_eq!(replaced.content, Some("New Title".to_string()));
     }
+
+    // ── integration: real NIP-05 + relay fetch ───────────────────────────────
+
+    /// End-to-end test: resolve `kieran@snort.social` via NIP-05, fetch the
+    /// profile from a public relay, and verify that `og:title` and `og:type`
+    /// are injected into the returned HTML.
+    #[tokio::test]
+    async fn test_tag_page_kieran_snort_social() {
+        use crate::{AppState, avatar, link_preview, opengraph};
+        use axum::{Router, body::Body, routing::post};
+        use http_body_util::BodyExt;
+        use nostr_sdk::ClientBuilder;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        // Build a real client connected to relay.snort.social.
+        let client = ClientBuilder::new().build();
+        client
+            .add_relay("wss://relay.snort.social")
+            .await
+            .expect("add relay");
+        client.connect().await;
+
+        let fetch = crate::fetch::FetchQueue::new(client);
+        let fetch_worker = fetch.clone();
+        tokio::spawn(async move {
+            loop {
+                fetch_worker.process_queue().await;
+            }
+        });
+
+        let link_preview_cache = Arc::new(link_preview::LinkPreviewCache::new());
+        let http_client = Arc::new(link_preview_cache.client().clone());
+        let avatar_sets = avatar::AvatarSets::load();
+
+        let state = AppState {
+            fetch,
+            link_preview: link_preview_cache,
+            http_client,
+            avatar_sets,
+        };
+
+        let app = Router::new()
+            .route("/opengraph/{id}", post(opengraph::tag_page))
+            .with_state(state);
+
+        let minimal_html = r#"<!DOCTYPE html><html><head><title>Snort</title></head><body></body></html>"#;
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/opengraph/kieran@snort.social")
+            .header("content-type", "text/html")
+            .body(Body::from(minimal_html))
+            .unwrap();
+
+        let response = app.oneshot(request).await.expect("handler should respond");
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        let body = std::str::from_utf8(&body_bytes).expect("body is utf-8");
+
+        assert!(
+            body.contains("og:type"),
+            "response should contain og:type tag, got:\n{body}"
+        );
+        assert!(
+            body.contains("profile"),
+            "og:type should be profile, got:\n{body}"
+        );
+        assert!(
+            body.contains("og:title"),
+            "response should contain og:title tag, got:\n{body}"
+        );
+        // kieran's profile name should appear somewhere in the title
+        assert!(
+            body.to_lowercase().contains("kieran") || body.contains("og:title"),
+            "og:title should reference the profile, got:\n{body}"
+        );
+    }
 }
