@@ -1,59 +1,66 @@
-use anyhow::Result;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
 use nostr_sdk::prelude::{Nip19, Nip19Event, RejectedReason, SaveEventStatus};
 use nostr_sdk::{Event, EventId, FromBech32, Kind, PublicKey};
-use rocket::http::Status;
-use rocket::serde::json::Json;
-use rocket::{Route, State};
 
 use crate::fetch::FetchQueue;
 
-pub fn routes() -> Vec<Route> {
-    routes![import_event, get_event, get_event_by_kind]
-}
-
-#[rocket::post("/event", data = "<data>")]
-async fn import_event(fetch: &State<FetchQueue>, data: Json<Event>) -> Status {
+pub async fn import_event(
+    State(fetch): State<FetchQueue>,
+    Json(data): Json<Event>,
+) -> Response {
     if data.verify().is_err() {
-        return Status::InternalServerError;
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
     let client = fetch.client();
     let db = client.database();
-    if let Ok(v) = db.save_event(&data).await {
-        match v {
-            SaveEventStatus::Success => Status::Ok,
+    match db.save_event(&data).await {
+        Ok(v) => match v {
+            SaveEventStatus::Success => StatusCode::OK.into_response(),
             SaveEventStatus::Rejected(r) => match r {
-                RejectedReason::Duplicate => Status::Conflict,
-                _ => Status::InternalServerError,
+                RejectedReason::Duplicate => StatusCode::CONFLICT.into_response(),
+                _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
             },
-        }
-    } else {
-        Status::InternalServerError
+        },
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
-#[rocket::get("/event/<id>")]
-async fn get_event(fetch: &State<FetchQueue>, id: &str) -> Result<Option<Json<Event>>, Status> {
-    let id = Nip19::from_bech32(id).map_err(|_| Status::InternalServerError)?;
-    Ok(fetch
-        .demand(&id)
-        .await
-        .map_err(|e| {
+pub async fn get_event(
+    State(fetch): State<FetchQueue>,
+    Path(id): Path<String>,
+) -> Response {
+    let id = match Nip19::from_bech32(&id) {
+        Ok(v) => v,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    match fetch.demand(&id).await {
+        Ok(Some(ev)) => Json(ev).into_response(),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
             error!("Failed get_event {}", e);
-            Status::InternalServerError
-        })?
-        .map(|r| Json::from(r)))
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
-#[rocket::get("/event/<kind>/<pubkey>")]
-async fn get_event_by_kind(
-    fetch: &State<FetchQueue>,
-    kind: u32,
-    pubkey: &str,
-) -> Result<Option<Json<Event>>, Status> {
-    let pk = PublicKey::parse(pubkey).map_err(|_| Status::InternalServerError)?;
+pub async fn get_event_by_kind(
+    State(fetch): State<FetchQueue>,
+    Path((kind, pubkey)): Path<(u32, String)>,
+) -> Response {
+    let pk = match PublicKey::parse(&pubkey) {
+        Ok(v) => v,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    if kind > u16::MAX as u32 {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let kind = Kind::from(kind as u16);
     if !kind.is_replaceable() {
-        return Ok(None);
+        return StatusCode::NO_CONTENT.into_response();
     }
 
     let id = Nip19::Event(Nip19Event {
@@ -62,12 +69,12 @@ async fn get_event_by_kind(
         author: Some(pk),
         relays: vec![],
     });
-    Ok(fetch
-        .demand(&id)
-        .await
-        .map_err(|e| {
+    match fetch.demand(&id).await {
+        Ok(Some(ev)) => Json(ev).into_response(),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
             error!("Failed get_event_by_kind {}", e);
-            Status::InternalServerError
-        })?
-        .map(|r| Json::from(r)))
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }

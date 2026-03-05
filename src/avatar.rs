@@ -1,34 +1,23 @@
-use rocket::Request;
-use rocket::fs::NamedFile;
-use rocket::http::Status;
-use rocket::response::Responder;
+use axum::extract::Path;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use axum::body::Body;
+use http::header;
 
-pub enum AvatarResponse {
-    File(NamedFile),
-    NotFound,
-}
-
-impl<'r> Responder<'r, 'static> for AvatarResponse {
-    fn respond_to(self, req: &'r Request<'_>) -> rocket::response::Result<'static> {
-        match self {
-            AvatarResponse::File(f) => f.respond_to(req),
-            AvatarResponse::NotFound => Err(Status::NotFound),
-        }
+pub async fn get_avatar(Path((set, value)): Path<(String, String)>) -> Response {
+    // Validate set against allowlist to prevent path traversal
+    if !matches!(set.as_str(), "cyberpunks" | "robots" | "zombies") {
+        return StatusCode::NOT_FOUND.into_response();
     }
-}
 
-/// Robohash avatar endpoint
-///
-/// Available sets: `cyberpunks` / `robots` / `zombies`
-#[get("/avatar/<set>/<value>")]
-pub async fn get_avatar(set: &str, value: &str) -> AvatarResponse {
     // Remove file extension from value
-    let value_no_ext = Path::new(&value)
+    let value_no_ext = PathBuf::from(&value)
         .file_stem()
         .and_then(|s| s.to_str())
-        .unwrap_or(&value);
+        .unwrap_or(&value)
+        .to_string();
 
     // Hash the value
     let mut hasher = Sha256::new();
@@ -42,29 +31,32 @@ pub async fn get_avatar(set: &str, value: &str) -> AvatarResponse {
     let dir = PathBuf::from("avatars").join(&set);
 
     // Get list of .webp files
-    let file_list: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+    let mut file_list: Vec<PathBuf> = match std::fs::read_dir(&dir) {
         Ok(entries) => entries
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("webp"))
             .collect(),
-        Err(_) => return AvatarResponse::NotFound,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
 
     if file_list.is_empty() {
-        return AvatarResponse::NotFound;
+        return StatusCode::NOT_FOUND.into_response();
     }
+
+    // Sort for determinism across runs
+    file_list.sort();
 
     // Pick image based on hash
-    let idx = hash_int.abs() as usize % file_list.len();
+    let idx = hash_int.unsigned_abs() as usize % file_list.len();
     let pick_img = &file_list[idx];
 
-    match NamedFile::open(pick_img).await {
-        Ok(file) => AvatarResponse::File(file),
-        Err(_) => AvatarResponse::NotFound,
+    match tokio::fs::read(pick_img).await {
+        Ok(bytes) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "image/webp")
+            .body(Body::from(bytes))
+            .unwrap(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
-}
-
-pub fn routes() -> Vec<rocket::Route> {
-    routes![get_avatar]
 }

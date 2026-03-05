@@ -1,23 +1,21 @@
 use crate::default_avatar;
 use crate::fetch::FetchQueue;
+use axum::body::Bytes;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use chrono::DateTime;
+use http::header;
 use nostr_sdk::nips::nip19::Nip19;
 use nostr_sdk::prelude::{Nip19Coordinate, Nip19Event};
 use nostr_sdk::{
     Alphabet, Event, FromBech32, Kind, Metadata, PublicKey, SingleLetterTag, TagKind, ToBech32,
 };
-use rocket::data::ByteUnit;
-use rocket::http::{ContentType, Status};
-use rocket::{Data, Route, State};
 use scraper::{ElementRef, Html, Selector};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
-
-pub fn routes() -> Vec<Route> {
-    routes![tag_page]
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct HeadElement {
@@ -96,15 +94,22 @@ impl HeadElement {
     }
 }
 
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 impl Display for HeadElement {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "<{}", self.element)?;
         for (k, v) in &self.attributes {
-            write!(f, " {}=\"{}\"", k, v)?;
+            write!(f, " {}=\"{}\"", html_escape(k), html_escape(v))?;
         }
         if let Some(c) = &self.content {
             write!(f, ">")?;
-            write!(f, "{}", c)?;
+            write!(f, "{}", html_escape(c))?;
             write!(f, "</{}>", self.element)?;
         } else {
             write!(f, " />")?;
@@ -152,15 +157,10 @@ fn parse_nip05(identifier: &str) -> Option<(String, String)> {
 }
 
 /// Resolve NIP-05 identifier to public key
-async fn resolve_nip05(identifier: &str) -> Option<PublicKey> {
+async fn resolve_nip05(client: &reqwest::Client, identifier: &str) -> Option<PublicKey> {
     let (name, domain) = parse_nip05(identifier)?;
 
     let url = format!("https://{}/.well-known/nostr.json?name={}", domain, name);
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .ok()?;
 
     let response = client.get(&url).send().await.ok()?;
 
@@ -174,34 +174,39 @@ async fn resolve_nip05(identifier: &str) -> Option<PublicKey> {
     PublicKey::from_hex(pubkey_hex).ok()
 }
 
+#[derive(Deserialize)]
+pub struct OpenGraphQuery {
+    canonical: Option<String>,
+}
+
 /// Inject opengraph tags into provided html
-#[post("/opengraph/<id>?<canonical>", data = "<body>", format = "text/html")]
-async fn tag_page(
-    fetch: &State<FetchQueue>,
-    id: &str,
-    canonical: Option<&str>,
-    body: Data<'_>,
-) -> Result<(ContentType, String), Status> {
-    let stream = body.open(ByteUnit::Mebibyte(1));
-    let html = stream.into_string().await.map_err(|e| {
-        warn!("Failed to read request body: {}", e);
-        Status::InternalServerError
-    })?;
-    let html = if html.is_complete() {
-        html.value
-    } else {
-        warn!("html is not complete, capped at {}", html.n);
-        return Err(Status::InternalServerError);
+pub async fn tag_page(
+    State(fetch): State<FetchQueue>,
+    Path(id): Path<String>,
+    Query(query): Query<OpenGraphQuery>,
+    body: Bytes,
+) -> Response {
+    let html = match String::from_utf8(body.to_vec()) {
+        Ok(s) => s,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
 
     // Try parsing as Nip19 first, then fall back to NIP-05
-    let nid = match Nip19::from_bech32(id) {
+    let nid = match Nip19::from_bech32(&id) {
         Ok(n) => Some(n),
         Err(_) => {
-            // Try NIP-05 resolution
-            if let Some(pubkey) = resolve_nip05(id).await {
-                info!("Resolved NIP-05 {} to {}", id, pubkey.to_hex());
-                Some(Nip19::Pubkey(pubkey))
+            // Try NIP-05 resolution using the shared client from FetchQueue
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .ok();
+            if let Some(c) = client {
+                if let Some(pubkey) = resolve_nip05(&c, &id).await {
+                    info!("Resolved NIP-05 {} to {}", id, pubkey.to_hex());
+                    Some(Nip19::Pubkey(pubkey))
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -210,28 +215,40 @@ async fn tag_page(
 
     let nid = match nid {
         Some(n) => n,
-        None => return Ok((ContentType::HTML, html)),
+        None => {
+            return (
+                [(header::CONTENT_TYPE, HeaderValue::from_static("text/html"))],
+                html,
+            )
+                .into_response()
+        }
     };
 
     let tags = match &nid {
         Nip19::EventId(_) | Nip19::Event(_) | Nip19::Coordinate(_) => {
-            if let Some(ev) = fetch.demand(&nid).await.map_err(|e| {
-                warn!("Failed to fetch event: {}", e);
-                Status::InternalServerError
-            })? {
-                get_event_tags(fetch, &ev, &canonical).await
-            } else {
-                Vec::new()
+            match fetch.demand(&nid).await {
+                Ok(Some(ev)) => get_event_tags(&fetch, &ev, &query.canonical).await,
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    warn!("Failed to fetch event: {}", e);
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
             }
         }
         Nip19::Profile(_) | Nip19::Pubkey(_) => {
             let pk = match &nid {
                 Nip19::Pubkey(p) => *p,
                 Nip19::Profile(np) => np.public_key,
-                _ => return Ok((ContentType::HTML, html)),
+                _ => {
+                    return (
+                        [(header::CONTENT_TYPE, HeaderValue::from_static("text/html"))],
+                        html,
+                    )
+                        .into_response()
+                }
             };
 
-            let profile_meta = get_profile_meta(fetch, &pk).await;
+            let profile_meta = get_profile_meta(&fetch, &pk).await;
             let pk_hex = pk.to_hex();
             let image = profile_meta
                 .as_ref()
@@ -260,19 +277,24 @@ async fn tag_page(
         _ => Vec::new(),
     };
 
-    if tags.is_empty() {
-        Ok((ContentType::HTML, html))
+    let result_html = if tags.is_empty() {
+        html
     } else {
         info!("Injecting {} tags for {}", tags.len(), id);
-        let result_html = inject_tags(&html, tags);
-        Ok((ContentType::HTML, result_html))
-    }
+        inject_tags(&html, tags)
+    };
+
+    (
+        [(header::CONTENT_TYPE, HeaderValue::from_static("text/html"))],
+        result_html,
+    )
+        .into_response()
 }
 
 async fn get_event_tags(
-    fetch: &State<FetchQueue>,
+    fetch: &FetchQueue,
     ev: &Event,
-    canonical: &Option<&str>,
+    canonical: &Option<String>,
 ) -> Vec<HeadElement> {
     let mut tags = match ev.kind {
         Kind::LiveEvent => {
@@ -414,7 +436,7 @@ async fn get_event_tags(
                 .and_then(|p| p.profile.name.as_deref())
                 .unwrap_or("");
 
-            let created_iso = DateTime::from_timestamp(ev.created_at.as_u64() as i64, 0)
+            let created_iso = DateTime::from_timestamp(ev.created_at.as_secs() as i64, 0)
                 .map(|dt| dt.to_rfc3339())
                 .unwrap_or_default();
 
@@ -437,7 +459,7 @@ async fn get_event_tags(
             let bech32 = ev
                 .coordinate()
                 .map(|r| Nip19::Coordinate(Nip19Coordinate::new(r.into_owned(), [])))
-                .unwrap_or(Nip19::Event(Nip19Event::from_event(&ev)));
+                .unwrap_or(Nip19::Event(Nip19Event::from(ev)));
             if let Ok(b) = bech32.to_bech32() {
                 let canonical_url = canonical_template.replace("%s", &b);
                 tags.push(HeadElement::new(
@@ -451,8 +473,8 @@ async fn get_event_tags(
     tags
 }
 
-async fn get_profile_meta(fetch: &State<FetchQueue>, pubkey: &PublicKey) -> Option<ProfileMeta> {
-    let profile = match fetch.get_profile(pubkey.clone()).await {
+async fn get_profile_meta(fetch: &FetchQueue, pubkey: &PublicKey) -> Option<ProfileMeta> {
+    let profile = match fetch.get_profile(*pubkey).await {
         Ok(Some(profile)) => profile,
         Ok(None) => return None,
         Err(e) => {
@@ -507,18 +529,24 @@ fn inject_tags(html: &str, tags: Vec<HeadElement>) -> String {
             new_head_content.push_str(tag.to_string().as_str());
         }
 
-        // Replace the entire head element
-        let mut html_string = html.to_string();
-        if let Some(hs) = html_string.find("<head")
-            && let Some(head_start_end) = html_string[hs..].find(">")
-            && let Some(head_close) = html_string[head_start_end..].find("</head>")
-        {
-            let head_start = hs + head_start_end + 1;
-            let head_end = head_start_end + head_close;
-            html_string.replace_range(head_start..head_end, &new_head_content);
+        // Rebuild the head element using the parsed source span
+        let head_html = head_element.html();
+        // Find the end of the opening tag within head_html
+        if let Some(open_end) = head_html.find('>') {
+            // Find the closing tag from the end
+            if let Some(close_start) = head_html.rfind("</head>") {
+                let mut result = html.to_string();
+                // Locate the head element in the original html
+                if let Some(head_pos) = result.find("<head") {
+                    let abs_open_end = head_pos + open_end + 1;
+                    let abs_close_start = head_pos + close_start;
+                    result.replace_range(abs_open_end..abs_close_start, &new_head_content);
+                }
+                return result;
+            }
         }
 
-        html_string
+        html.to_string()
     } else {
         warn!("No head element found in document");
         html.to_string()

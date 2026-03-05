@@ -1,7 +1,8 @@
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
 use moka::future::Cache;
-use rocket::http::Status;
-use rocket::serde::json::Json;
-use rocket::{Route, State};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -45,7 +46,7 @@ impl LinkPreviewCache {
         }
     }
 
-    async fn get_preview(&self, url: &str) -> Option<LinkPreviewData> {
+    pub async fn get_preview(&self, url: &str) -> Option<LinkPreviewData> {
         let url_hash = {
             let mut hasher = Sha256::new();
             hasher.update(url.to_lowercase().as_bytes());
@@ -104,7 +105,7 @@ impl LinkPreviewCache {
         let document = Html::parse_document(&body);
 
         // Parse OpenGraph tags
-        let og_selector = Selector::parse("meta[property*='og']").expect("invalid selector");
+        let og_selector = Selector::parse("meta[property^='og:']").expect("invalid selector");
         let mut og_tags = Vec::new();
 
         for element in document.select(&og_selector) {
@@ -158,17 +159,17 @@ impl LinkPreviewCache {
     }
 }
 
-pub fn routes() -> Vec<Route> {
-    routes![get_preview]
+#[derive(Deserialize)]
+pub struct PreviewQuery {
+    url: String,
 }
 
-#[get("/preview?<url>")]
-async fn get_preview(
-    cache: &State<Arc<LinkPreviewCache>>,
-    url: &str,
-) -> Result<Json<LinkPreviewData>, Status> {
-    match cache.get_preview(url).await {
-        Some(data) => Ok(Json(data)),
-        None => Err(Status::NotFound),
+pub async fn get_preview(
+    State(cache): State<Arc<LinkPreviewCache>>,
+    Query(q): Query<PreviewQuery>,
+) -> Response {
+    match cache.get_preview(&q.url).await {
+        Some(data) => Json(data).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
