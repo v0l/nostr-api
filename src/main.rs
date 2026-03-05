@@ -56,6 +56,9 @@ impl FromRef<AppState> for avatar::AvatarSets {
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
 
     let builder = Config::builder()
         .add_source(config::File::with_name("config.yaml").required(false))
