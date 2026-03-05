@@ -16,6 +16,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct HeadElement {
@@ -153,7 +154,26 @@ fn parse_nip05(identifier: &str) -> Option<(String, String)> {
         return None;
     }
 
-    Some((name.to_lowercase(), domain.to_lowercase()))
+    let domain_lower = domain.to_lowercase();
+
+    // Reject private/internal TLDs and hostnames
+    if domain_lower == "localhost"
+        || domain_lower.ends_with(".local")
+        || domain_lower.ends_with(".internal")
+        || domain_lower.ends_with(".localhost")
+    {
+        return None;
+    }
+
+    // Reject bare IPv4 addresses (all-numeric labels, e.g. "192.168.1.1")
+    let is_ipv4 = domain_lower
+        .split('.')
+        .all(|label| label.parse::<u8>().is_ok());
+    if is_ipv4 {
+        return None;
+    }
+
+    Some((name.to_lowercase(), domain_lower))
 }
 
 /// Resolve NIP-05 identifier to public key
@@ -182,6 +202,7 @@ pub struct OpenGraphQuery {
 /// Inject opengraph tags into provided html
 pub async fn tag_page(
     State(fetch): State<FetchQueue>,
+    State(http_client): State<Arc<reqwest::Client>>,
     Path(id): Path<String>,
     Query(query): Query<OpenGraphQuery>,
     body: Bytes,
@@ -195,18 +216,10 @@ pub async fn tag_page(
     let nid = match Nip19::from_bech32(&id) {
         Ok(n) => Some(n),
         Err(_) => {
-            // Try NIP-05 resolution using the shared client from FetchQueue
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .ok();
-            if let Some(c) = client {
-                if let Some(pubkey) = resolve_nip05(&c, &id).await {
-                    info!("Resolved NIP-05 {} to {}", id, pubkey.to_hex());
-                    Some(Nip19::Pubkey(pubkey))
-                } else {
-                    None
-                }
+            // Try NIP-05 resolution using the shared HTTP client
+            if let Some(pubkey) = resolve_nip05(&http_client, &id).await {
+                info!("Resolved NIP-05 {} to {}", id, pubkey.to_hex());
+                Some(Nip19::Pubkey(pubkey))
             } else {
                 None
             }
@@ -454,20 +467,20 @@ async fn get_event_tags(
             ])
         }
     };
-    if let Some(canonical_template) = canonical {
-        if canonical_template.contains("%s") {
-            let bech32 = ev
-                .coordinate()
-                .map(|r| Nip19::Coordinate(Nip19Coordinate::new(r.into_owned(), [])))
-                .unwrap_or(Nip19::Event(Nip19Event::from(ev)));
-            if let Ok(b) = bech32.to_bech32() {
-                let canonical_url = canonical_template.replace("%s", &b);
-                tags.push(HeadElement::new(
-                    "link",
-                    &[("rel", "canonical"), ("href", canonical_url.as_str())],
-                    None,
-                ));
-            }
+    if let Some(canonical_template) = canonical
+        && canonical_template.contains("%s")
+    {
+        let bech32 = ev
+            .coordinate()
+            .map(|r| Nip19::Coordinate(Nip19Coordinate::new(r.into_owned(), [])))
+            .unwrap_or(Nip19::Event(Nip19Event::from(ev)));
+        if let Ok(b) = bech32.to_bech32() {
+            let canonical_url = canonical_template.replace("%s", &b);
+            tags.push(HeadElement::new(
+                "link",
+                &[("rel", "canonical"), ("href", canonical_url.as_str())],
+                None,
+            ));
         }
     }
     tags
@@ -559,4 +572,451 @@ fn meta_tags_to_elements(tags: Vec<(&str, &str)>) -> Vec<HeadElement> {
             HeadElement::new("meta", &[("property", key), ("content", value)], None)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scraper::Html;
+
+    // ── html_escape ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_html_escape_ampersand() {
+        assert_eq!(html_escape("a&b"), "a&amp;b");
+    }
+
+    #[test]
+    fn test_html_escape_double_quote() {
+        assert_eq!(html_escape("say \"hi\""), "say &quot;hi&quot;");
+    }
+
+    #[test]
+    fn test_html_escape_less_than() {
+        assert_eq!(html_escape("a<b"), "a&lt;b");
+    }
+
+    #[test]
+    fn test_html_escape_greater_than() {
+        assert_eq!(html_escape("a>b"), "a&gt;b");
+    }
+
+    #[test]
+    fn test_html_escape_all_chars() {
+        assert_eq!(html_escape("<\"a&b\">"), "&lt;&quot;a&amp;b&quot;&gt;");
+    }
+
+    #[test]
+    fn test_html_escape_clean_string() {
+        assert_eq!(html_escape("hello world"), "hello world");
+    }
+
+    // ── parse_nip05 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_nip05_valid() {
+        let result = parse_nip05("alice@example.com");
+        assert_eq!(result, Some(("alice".to_string(), "example.com".to_string())));
+    }
+
+    #[test]
+    fn test_parse_nip05_normalises_to_lowercase() {
+        let result = parse_nip05("Alice@Example.COM");
+        // uppercase name chars are rejected by the name validator
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_nip05_lowercase_domain_normalised() {
+        let result = parse_nip05("bob@Example.COM");
+        assert_eq!(result, Some(("bob".to_string(), "example.com".to_string())));
+    }
+
+    #[test]
+    fn test_parse_nip05_missing_at() {
+        assert!(parse_nip05("nodomain").is_none());
+    }
+
+    #[test]
+    fn test_parse_nip05_multiple_at_signs() {
+        assert!(parse_nip05("a@b@c.com").is_none());
+    }
+
+    #[test]
+    fn test_parse_nip05_domain_no_dot() {
+        assert!(parse_nip05("alice@localhost").is_none());
+    }
+
+    #[test]
+    fn test_parse_nip05_empty_domain() {
+        assert!(parse_nip05("alice@").is_none());
+    }
+
+    #[test]
+    fn test_parse_nip05_invalid_name_char() {
+        // uppercase rejected
+        assert!(parse_nip05("Alice@example.com").is_none());
+        // space rejected
+        assert!(parse_nip05("ali ce@example.com").is_none());
+    }
+
+    #[test]
+    fn test_parse_nip05_allowed_name_chars() {
+        // digits, hyphens, underscores, dots are all valid
+        assert!(parse_nip05("a1-_.@example.com").is_some());
+    }
+
+    #[test]
+    fn test_parse_nip05_rejects_dot_local() {
+        assert!(parse_nip05("alice@printer.local").is_none());
+    }
+
+    #[test]
+    fn test_parse_nip05_rejects_dot_internal() {
+        assert!(parse_nip05("alice@db.internal").is_none());
+    }
+
+    #[test]
+    fn test_parse_nip05_rejects_dot_localhost() {
+        assert!(parse_nip05("alice@foo.localhost").is_none());
+    }
+
+    #[test]
+    fn test_parse_nip05_rejects_ipv4_address() {
+        assert!(parse_nip05("alice@192.168.1.1").is_none());
+        assert!(parse_nip05("alice@10.0.0.1").is_none());
+        assert!(parse_nip05("alice@127.0.0.1").is_none());
+    }
+
+    #[test]
+    fn test_parse_nip05_allows_numeric_labels_that_are_not_full_ipv4() {
+        // "1.example.com" — not all labels are octets so it should pass
+        assert!(parse_nip05("alice@1.example.com").is_some());
+    }
+
+    // ── HeadElement::new / meta_content / as_title ───────────────────────────
+
+    #[test]
+    fn test_head_element_meta_content_present() {
+        let el = HeadElement::new(
+            "meta",
+            &[("property", "og:title"), ("content", "Hello")],
+            None,
+        );
+        assert_eq!(el.meta_content(), Some("Hello"));
+    }
+
+    #[test]
+    fn test_head_element_meta_content_absent() {
+        let el = HeadElement::new("meta", &[("property", "og:title")], None);
+        assert_eq!(el.meta_content(), None);
+    }
+
+    #[test]
+    fn test_head_element_meta_content_non_meta_element() {
+        let el = HeadElement::new("title", &[], Some("My Title"));
+        assert_eq!(el.meta_content(), None);
+    }
+
+    #[test]
+    fn test_head_element_as_title_og_title_produces_title_element() {
+        let el = HeadElement::new(
+            "meta",
+            &[("property", "og:title"), ("content", "My Page")],
+            None,
+        );
+        let title = el.as_title().unwrap();
+        assert_eq!(title.element, "title");
+        assert_eq!(title.content, Some("My Page".to_string()));
+    }
+
+    #[test]
+    fn test_head_element_as_title_non_og_title_returns_none() {
+        let el = HeadElement::new(
+            "meta",
+            &[("property", "og:description"), ("content", "Desc")],
+            None,
+        );
+        assert!(el.as_title().is_none());
+    }
+
+    #[test]
+    fn test_head_element_as_title_non_meta_returns_none() {
+        let el = HeadElement::new("title", &[], Some("Title"));
+        assert!(el.as_title().is_none());
+    }
+
+    // ── HeadElement Display (and html_escape integration) ────────────────────
+
+    #[test]
+    fn test_display_self_closing_meta() {
+        let el = HeadElement::new(
+            "meta",
+            &[("property", "og:title"), ("content", "Hello")],
+            None,
+        );
+        let s = el.to_string();
+        assert!(s.starts_with("<meta "));
+        assert!(s.ends_with("/>"));
+        assert!(s.contains("property=\"og:title\""));
+        assert!(s.contains("content=\"Hello\""));
+    }
+
+    #[test]
+    fn test_display_element_with_content() {
+        let el = HeadElement::new("title", &[], Some("My Page"));
+        let s = el.to_string();
+        assert_eq!(s, "<title>My Page</title>");
+    }
+
+    #[test]
+    fn test_display_escapes_attribute_values() {
+        let el = HeadElement::new(
+            "meta",
+            &[("property", "og:title"), ("content", "Bob & Alice \"say\" <hi>")],
+            None,
+        );
+        let s = el.to_string();
+        assert!(s.contains("Bob &amp; Alice &quot;say&quot; &lt;hi&gt;"));
+    }
+
+    #[test]
+    fn test_display_escapes_content() {
+        let el = HeadElement::new("title", &[], Some("<script>alert(1)</script>"));
+        let s = el.to_string();
+        assert!(!s.contains("<script>"));
+        assert!(s.contains("&lt;script&gt;"));
+    }
+
+    // ── meta_tags_to_elements ────────────────────────────────────────────────
+
+    #[test]
+    fn test_meta_tags_to_elements_count() {
+        let tags = meta_tags_to_elements(vec![
+            ("og:title", "Hello"),
+            ("og:description", "World"),
+        ]);
+        assert_eq!(tags.len(), 2);
+    }
+
+    #[test]
+    fn test_meta_tags_to_elements_structure() {
+        let tags = meta_tags_to_elements(vec![("og:title", "Hi")]);
+        let el = &tags[0];
+        assert_eq!(el.element, "meta");
+        assert!(el.attributes.iter().any(|(k, v)| k == "property" && v == "og:title"));
+        assert!(el.attributes.iter().any(|(k, v)| k == "content" && v == "Hi"));
+        assert!(el.content.is_none());
+    }
+
+    #[test]
+    fn test_meta_tags_to_elements_empty() {
+        let tags = meta_tags_to_elements(vec![]);
+        assert!(tags.is_empty());
+    }
+
+    // ── inject_tags ──────────────────────────────────────────────────────────
+
+    fn base_html() -> &'static str {
+        r#"<!DOCTYPE html><html><head><title>Old Title</title><meta property="og:description" content="old" /></head><body></body></html>"#
+    }
+
+    #[test]
+    fn test_inject_tags_replaces_existing_og_meta() {
+        let tags = meta_tags_to_elements(vec![("og:description", "new description")]);
+        let result = inject_tags(base_html(), tags);
+        assert!(result.contains("new description"));
+        assert!(!result.contains("content=\"old\""));
+    }
+
+    #[test]
+    fn test_inject_tags_appends_new_tags() {
+        let tags = meta_tags_to_elements(vec![("og:image", "https://example.com/img.png")]);
+        let result = inject_tags(base_html(), tags);
+        assert!(result.contains("og:image"));
+        assert!(result.contains("https://example.com/img.png"));
+    }
+
+    #[test]
+    fn test_inject_tags_replaces_title_via_og_title() {
+        let tags = meta_tags_to_elements(vec![("og:title", "New Title")]);
+        let result = inject_tags(base_html(), tags);
+        assert!(result.contains("<title>New Title</title>"));
+        assert!(!result.contains("<title>Old Title</title>"));
+    }
+
+    #[test]
+    fn test_inject_tags_no_head_returns_original() {
+        let html = "<html><body>no head here</body></html>";
+        let tags = meta_tags_to_elements(vec![("og:title", "Hi")]);
+        let result = inject_tags(html, tags);
+        // No head to inject into — original returned
+        assert_eq!(result, html);
+    }
+
+    #[test]
+    fn test_inject_tags_empty_tags_list() {
+        // With no tags the head children are all preserved unchanged.
+        let result = inject_tags(base_html(), vec![]);
+        assert!(result.contains("<title>Old Title</title>"));
+    }
+
+    #[test]
+    fn test_inject_tags_escapes_injected_values() {
+        let tags = meta_tags_to_elements(vec![("og:title", "A & B <test>")]);
+        let result = inject_tags(base_html(), tags);
+        assert!(result.contains("A &amp; B &lt;test&gt;"));
+        assert!(!result.contains("<test>"));
+    }
+
+    #[test]
+    fn test_inject_tags_empty_head_appends_all_tags() {
+        let html = "<html><head></head><body></body></html>";
+        let tags = meta_tags_to_elements(vec![("og:title", "Hi"), ("og:image", "https://x.com/img.png")]);
+        let result = inject_tags(html, tags);
+        assert!(result.contains("og:title"));
+        assert!(result.contains("og:image"));
+    }
+
+    #[test]
+    fn test_inject_tags_head_with_attributes_is_handled() {
+        // The `>` in `<head lang="en">` must not confuse the open-tag boundary detection.
+        let html = r#"<!DOCTYPE html><html><head lang="en"><title>T</title></head><body></body></html>"#;
+        let tags = meta_tags_to_elements(vec![("og:title", "New")]);
+        let result = inject_tags(html, tags);
+        assert!(result.contains("<title>New</title>"));
+        assert!(!result.contains("<title>T</title>"));
+        // The head opening tag and attributes must still be present
+        assert!(result.contains(r#"lang="en""#));
+    }
+
+    #[test]
+    fn test_inject_tags_preserves_unmatched_existing_children() {
+        // og:title is replaced; the charset meta must survive untouched.
+        let html = r#"<html><head><meta charset="utf-8"><meta property="og:title" content="old" /></head></html>"#;
+        let tags = meta_tags_to_elements(vec![("og:title", "New")]);
+        let result = inject_tags(html, tags);
+        assert!(result.contains(r#"charset="utf-8""#));
+        assert!(result.contains("New"));
+        assert!(!result.contains("content=\"old\""));
+    }
+
+    #[test]
+    fn test_inject_tags_body_is_not_modified() {
+        let html = r#"<html><head></head><body><p>Keep me</p></body></html>"#;
+        let tags = meta_tags_to_elements(vec![("og:title", "Hi")]);
+        let result = inject_tags(html, tags);
+        assert!(result.contains("<p>Keep me</p>"));
+    }
+
+    #[test]
+    fn test_inject_tags_duplicate_input_tags_not_appended_twice() {
+        // Two og:title entries in the input vec; the second is a duplicate.
+        // After the first matches and is inserted into `replaced`, the second
+        // should NOT be appended again (the HashSet deduplicates equal HeadElements).
+        let tags = vec![
+            HeadElement::new("meta", &[("property", "og:title"), ("content", "A")], None),
+            HeadElement::new("meta", &[("property", "og:title"), ("content", "A")], None),
+        ];
+        let html = r#"<html><head><meta property="og:title" content="old" /></head></html>"#;
+        let result = inject_tags(html, tags);
+        // The value "A" should appear exactly once as a content attribute.
+        let count = result.matches("content=\"A\"").count();
+        assert_eq!(count, 1, "duplicate tag appeared {count} times");
+    }
+
+    #[test]
+    fn test_inject_tags_meta_matched_by_name_attribute() {
+        // is_match checks `name` attr as a fallback when `property` is absent.
+        let html = r#"<html><head><meta name="description" content="old desc" /></head></html>"#;
+        let tag = HeadElement::new(
+            "meta",
+            &[("name", "description"), ("content", "new desc")],
+            None,
+        );
+        let result = inject_tags(html, vec![tag]);
+        assert!(result.contains("new desc"));
+        assert!(!result.contains("old desc"));
+    }
+
+    #[test]
+    fn test_inject_tags_og_title_appended_when_no_existing_title() {
+        // No <title> element in head; og:title tag should be appended (not replace anything).
+        let html = r#"<html><head><meta charset="utf-8" /></head><body></body></html>"#;
+        let tags = meta_tags_to_elements(vec![("og:title", "Appended")]);
+        let result = inject_tags(html, tags);
+        assert!(result.contains("og:title"));
+        assert!(result.contains("Appended"));
+    }
+
+    #[test]
+    fn test_inject_tags_multiple_replacements_in_one_call() {
+        let html = r#"<html><head>
+            <title>Old</title>
+            <meta property="og:description" content="old desc" />
+            <meta property="og:image" content="old.png" />
+        </head></html>"#;
+        let tags = meta_tags_to_elements(vec![
+            ("og:title", "New Title"),
+            ("og:description", "new desc"),
+            ("og:image", "new.png"),
+        ]);
+        let result = inject_tags(html, tags);
+        assert!(result.contains("<title>New Title</title>"));
+        assert!(result.contains("new desc"));
+        assert!(result.contains("new.png"));
+        assert!(!result.contains("old desc"));
+        assert!(!result.contains("old.png"));
+    }
+
+    // ── HeadElement::replace_with / is_match (via inject_tags DOM path) ──────
+
+    #[test]
+    fn test_replace_with_matching_meta_returns_self() {
+        let html = r#"<html><head><meta property="og:title" content="old" /></head></html>"#;
+        let doc = Html::parse_document(html);
+        let sel = Selector::parse("meta[property='og:title']").unwrap();
+        let node = doc.select(&sel).next().unwrap();
+
+        let el = HeadElement::new(
+            "meta",
+            &[("property", "og:title"), ("content", "new")],
+            None,
+        );
+        let replaced = el.replace_with(node).unwrap();
+        assert_eq!(replaced, el);
+    }
+
+    #[test]
+    fn test_replace_with_non_matching_meta_returns_none() {
+        let html = r#"<html><head><meta property="og:description" content="d" /></head></html>"#;
+        let doc = Html::parse_document(html);
+        let sel = Selector::parse("meta[property='og:description']").unwrap();
+        let node = doc.select(&sel).next().unwrap();
+
+        // og:title element does NOT match og:description node
+        let el = HeadElement::new(
+            "meta",
+            &[("property", "og:title"), ("content", "new")],
+            None,
+        );
+        assert!(el.replace_with(node).is_none());
+    }
+
+    #[test]
+    fn test_replace_with_title_node_and_og_title_tag() {
+        let html = r#"<html><head><title>Old</title></head></html>"#;
+        let doc = Html::parse_document(html);
+        let sel = Selector::parse("title").unwrap();
+        let node = doc.select(&sel).next().unwrap();
+
+        let el = HeadElement::new(
+            "meta",
+            &[("property", "og:title"), ("content", "New Title")],
+            None,
+        );
+        let replaced = el.replace_with(node).unwrap();
+        assert_eq!(replaced.element, "title");
+        assert_eq!(replaced.content, Some("New Title".to_string()));
+    }
 }

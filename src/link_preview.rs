@@ -6,7 +6,8 @@ use moka::future::Cache;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::net::IpAddr;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +22,55 @@ pub struct LinkPreviewData {
     pub image: Option<String>,
 }
 
+static TITLE_SELECTOR: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("title").expect("invalid selector"));
+static DESC_SELECTOR: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("meta[name='description']").expect("invalid selector"));
+static OG_SELECTOR: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("meta[property^='og:']").expect("invalid selector"));
+
+/// Returns `true` if the IP address is non-routable (loopback, private, link-local, etc.)
+fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+        }
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+    }
+}
+
+/// Validates a URL is safe to fetch (https scheme, public host).
+/// Returns an error string describing the problem, or `Ok(())` if safe.
+pub fn validate_preview_url(url: &str) -> Result<(), &'static str> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| "invalid URL")?;
+
+    if parsed.scheme() != "https" {
+        return Err("only https URLs are allowed");
+    }
+
+    let host = parsed.host_str().ok_or("missing host")?;
+
+    // Reject numeric IPv4/IPv6 hosts that resolve to private ranges directly
+    if let Ok(ip) = host.parse::<IpAddr>()
+        && is_private_ip(ip)
+    {
+        return Err("private/loopback IP addresses are not allowed");
+    }
+
+    // Reject localhost by name
+    let lower = host.to_lowercase();
+    if lower == "localhost" || lower.ends_with(".local") || lower.ends_with(".internal") {
+        return Err("local hostnames are not allowed");
+    }
+
+    Ok(())
+}
+
 pub struct LinkPreviewCache {
     cache: Cache<String, Option<LinkPreviewData>>,
     empty_cache: Cache<String, bool>,
@@ -28,6 +78,10 @@ pub struct LinkPreviewCache {
 }
 
 impl LinkPreviewCache {
+    pub fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
+
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36 Snort/1.0 (LinkPreview; https://nostr-rs-api.v0l.io)")
@@ -84,6 +138,8 @@ impl LinkPreviewCache {
     }
 
     async fn fetch_and_parse(&self, url: &str) -> anyhow::Result<Option<LinkPreviewData>> {
+        validate_preview_url(url).map_err(|e| anyhow::anyhow!("URL validation failed: {}", e))?;
+
         let response = self.client.get(url).send().await?;
 
         if !response.status().is_success() {
@@ -105,17 +161,16 @@ impl LinkPreviewCache {
         let document = Html::parse_document(&body);
 
         // Parse OpenGraph tags
-        let og_selector = Selector::parse("meta[property^='og:']").expect("invalid selector");
         let mut og_tags = Vec::new();
 
-        for element in document.select(&og_selector) {
+        for element in document.select(&OG_SELECTOR) {
             if let (Some(property), Some(content)) = (
                 element.value().attr("property"),
                 element.value().attr("content"),
-            ) {
-                if !property.is_empty() && !content.is_empty() {
-                    og_tags.push((property.to_string(), content.to_string()));
-                }
+            )
+                && !property.is_empty() && !content.is_empty()
+            {
+                og_tags.push((property.to_string(), content.to_string()));
             }
         }
 
@@ -125,9 +180,8 @@ impl LinkPreviewCache {
             .find(|(k, _)| k == "og:title")
             .map(|(_, v)| v.clone())
             .or_else(|| {
-                let title_selector = Selector::parse("title").unwrap();
                 document
-                    .select(&title_selector)
+                    .select(&TITLE_SELECTOR)
                     .next()
                     .map(|e| e.text().collect::<String>())
             });
@@ -137,9 +191,8 @@ impl LinkPreviewCache {
             .find(|(k, _)| k == "og:description")
             .map(|(_, v)| v.clone())
             .or_else(|| {
-                let desc_selector = Selector::parse("meta[name='description']").unwrap();
                 document
-                    .select(&desc_selector)
+                    .select(&DESC_SELECTOR)
                     .next()
                     .and_then(|e| e.value().attr("content"))
                     .map(|s| s.to_string())
@@ -168,8 +221,125 @@ pub async fn get_preview(
     State(cache): State<Arc<LinkPreviewCache>>,
     Query(q): Query<PreviewQuery>,
 ) -> Response {
+    if let Err(reason) = validate_preview_url(&q.url) {
+        warn!("Rejected preview URL '{}': {}", q.url, reason);
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     match cache.get_preview(&q.url).await {
         Some(data) => Json(data).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_private_ip_loopback_v4() {
+        assert!(is_private_ip("127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_is_private_ip_private_v4() {
+        assert!(is_private_ip("192.168.1.1".parse().unwrap()));
+        assert!(is_private_ip("10.0.0.1".parse().unwrap()));
+        assert!(is_private_ip("172.16.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_is_private_ip_link_local_v4() {
+        assert!(is_private_ip("169.254.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_is_private_ip_broadcast_v4() {
+        assert!(is_private_ip("255.255.255.255".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_is_private_ip_unspecified_v4() {
+        assert!(is_private_ip("0.0.0.0".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_is_private_ip_public_v4() {
+        assert!(!is_private_ip("1.1.1.1".parse().unwrap()));
+        assert!(!is_private_ip("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_is_private_ip_loopback_v6() {
+        assert!(is_private_ip("::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_is_private_ip_unspecified_v6() {
+        assert!(is_private_ip("::".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_is_private_ip_public_v6() {
+        assert!(!is_private_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_validate_preview_url_valid_https() {
+        assert!(validate_preview_url("https://example.com/page").is_ok());
+    }
+
+    #[test]
+    fn test_validate_preview_url_rejects_http() {
+        let err = validate_preview_url("http://example.com/page").unwrap_err();
+        assert_eq!(err, "only https URLs are allowed");
+    }
+
+    #[test]
+    fn test_validate_preview_url_rejects_file_scheme() {
+        let err = validate_preview_url("file:///etc/passwd").unwrap_err();
+        assert_eq!(err, "only https URLs are allowed");
+    }
+
+    #[test]
+    fn test_validate_preview_url_rejects_loopback_ip() {
+        let err = validate_preview_url("https://127.0.0.1/secret").unwrap_err();
+        assert_eq!(err, "private/loopback IP addresses are not allowed");
+    }
+
+    #[test]
+    fn test_validate_preview_url_rejects_private_ip() {
+        let err = validate_preview_url("https://192.168.0.1/").unwrap_err();
+        assert_eq!(err, "private/loopback IP addresses are not allowed");
+    }
+
+    #[test]
+    fn test_validate_preview_url_rejects_metadata_ip() {
+        // AWS instance metadata endpoint
+        let err = validate_preview_url("https://169.254.169.254/latest/meta-data/").unwrap_err();
+        assert_eq!(err, "private/loopback IP addresses are not allowed");
+    }
+
+    #[test]
+    fn test_validate_preview_url_rejects_localhost_name() {
+        let err = validate_preview_url("https://localhost/api").unwrap_err();
+        assert_eq!(err, "local hostnames are not allowed");
+    }
+
+    #[test]
+    fn test_validate_preview_url_rejects_dot_local() {
+        let err = validate_preview_url("https://myservice.local/api").unwrap_err();
+        assert_eq!(err, "local hostnames are not allowed");
+    }
+
+    #[test]
+    fn test_validate_preview_url_rejects_dot_internal() {
+        let err = validate_preview_url("https://db.internal/api").unwrap_err();
+        assert_eq!(err, "local hostnames are not allowed");
+    }
+
+    #[test]
+    fn test_validate_preview_url_rejects_invalid_url() {
+        let err = validate_preview_url("not a url").unwrap_err();
+        assert_eq!(err, "invalid URL");
     }
 }

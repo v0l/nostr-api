@@ -6,7 +6,8 @@ use nostr_sdk::{Client, Event, EventId, Filter, JsonUtil, Kind, Metadata, Public
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, Notify, oneshot};
+use tokio::task::JoinSet;
 
 struct QueueItem {
     pub handler: oneshot::Sender<Option<Event>>,
@@ -16,6 +17,7 @@ struct QueueItem {
 #[derive(Clone)]
 pub struct FetchQueue {
     queue: Arc<Mutex<VecDeque<QueueItem>>>,
+    notify: Arc<Notify>,
     client: Client,
     profile_cache: Cache<PublicKey, Option<Metadata>>,
     event_cache: Cache<String, Event>,
@@ -25,6 +27,7 @@ impl FetchQueue {
     pub fn new(client: Client) -> Self {
         Self {
             queue: Arc::new(Mutex::new(VecDeque::new())),
+            notify: Arc::new(Notify::new()),
             client,
             profile_cache: Cache::builder()
                 .time_to_live(Duration::from_secs(24 * 60 * 60)) // 1 day
@@ -83,6 +86,7 @@ impl FetchQueue {
                 request: ent.clone(),
             });
         }
+        self.notify.notify_one();
         let res = rx
             .await
             .map_err(|e| anyhow::anyhow!("Failed to demand {}", e))?;
@@ -96,12 +100,13 @@ impl FetchQueue {
     }
 
     pub async fn process_queue(&self) {
+        self.notify.notified().await;
         let mut q_lock = self.queue.lock().await;
         let mut batch = Vec::new();
         while let Some(q) = q_lock.pop_front() {
             batch.push(q);
         }
-        if batch.len() > 0 {
+        if !batch.is_empty() {
             let filters: Vec<Filter> = batch
                 .iter()
                 .map(move |x| Self::nip19_to_filter(&x.request).unwrap())
@@ -111,21 +116,23 @@ impl FetchQueue {
                 "Sending filters: {}",
                 serde_json::to_string(&filters).unwrap()
             );
-            let mut all_events = Events::default();
+            let mut join_set = JoinSet::new();
             for filter in filters {
-                match self
-                    .client
-                    .fetch_events(filter, Duration::from_secs(2))
-                    .await
-                {
-                    Ok(events) => {
+                let client = self.client.clone();
+                join_set.spawn(async move {
+                    client.fetch_events(filter, Duration::from_secs(2)).await
+                });
+            }
+            let mut all_events = Events::default();
+            while let Some(result) = join_set.join_next().await {
+                match result {
+                    Ok(Ok(events)) => {
                         events.into_iter().for_each(|e| {
                             all_events.insert(e);
                         });
                     }
-                    Err(e) => {
-                        warn!("Failed to fetch events: {}", e);
-                    }
+                    Ok(Err(e)) => warn!("Failed to fetch events: {}", e),
+                    Err(e) => warn!("Fetch task panicked: {}", e),
                 }
             }
             for b in batch {
@@ -133,7 +140,9 @@ impl FetchQueue {
                 let ev = all_events
                     .iter()
                     .find(|e| f.match_event(e, MatchEventOptions::new()));
-                b.handler.send(ev.cloned()).unwrap()
+                if b.handler.send(ev.cloned()).is_err() {
+                    warn!("process_queue: receiver dropped before response could be sent");
+                }
             }
         }
     }
@@ -161,7 +170,68 @@ impl FetchQueue {
             }
             Nip19::EventId(e) => Some(Filter::new().id(e)),
             Nip19::Pubkey(pk) => Some(Filter::new().author(pk).kind(Kind::Metadata)),
+            Nip19::Profile(p) => Some(
+                Filter::new()
+                    .author(p.public_key)
+                    .kind(Kind::Metadata),
+            ),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr_sdk::prelude::Nip19Profile;
+
+    fn dummy_pubkey() -> PublicKey {
+        PublicKey::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_nip19_to_filter_pubkey_returns_metadata_filter() {
+        let pk = dummy_pubkey();
+        let nip19 = Nip19::Pubkey(pk);
+        let filter = FetchQueue::nip19_to_filter(&nip19).unwrap();
+        // Should be a metadata filter for this author
+        let json = serde_json::to_value(&filter).unwrap();
+        let kinds = json["kinds"].as_array().unwrap();
+        assert!(kinds.iter().any(|k| k.as_u64() == Some(0)));
+    }
+
+    #[test]
+    fn test_nip19_to_filter_profile_returns_metadata_filter() {
+        let pk = dummy_pubkey();
+        let profile = Nip19Profile {
+            public_key: pk,
+            relays: vec![],
+        };
+        let nip19 = Nip19::Profile(profile);
+        let filter = FetchQueue::nip19_to_filter(&nip19).unwrap();
+        let json = serde_json::to_value(&filter).unwrap();
+        let kinds = json["kinds"].as_array().unwrap();
+        assert!(kinds.iter().any(|k| k.as_u64() == Some(0)));
+    }
+
+    #[test]
+    fn test_nip19_to_filter_event_id() {
+        let event_id = EventId::all_zeros();
+        let nip19 = Nip19::EventId(event_id);
+        let filter = FetchQueue::nip19_to_filter(&nip19);
+        assert!(filter.is_some());
+    }
+
+    #[test]
+    fn test_nip19_to_filter_unknown_returns_none() {
+        // Nip19::Secret is the remaining catch-all
+        use nostr_sdk::SecretKey;
+        let sk = SecretKey::generate();
+        let nip19 = Nip19::Secret(sk);
+        let filter = FetchQueue::nip19_to_filter(&nip19);
+        assert!(filter.is_none());
     }
 }
