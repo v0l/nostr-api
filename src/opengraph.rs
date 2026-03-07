@@ -13,6 +13,7 @@ use nostr_sdk::{
 };
 use scraper::{ElementRef, Html, Selector};
 use serde::Deserialize;
+use serde_json::json;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
@@ -276,7 +277,9 @@ pub async fn tag_page(
                 .map(|p| p.description.clone())
                 .unwrap_or_default();
 
-            meta_tags_to_elements(vec![
+            let json_ld = profile_meta.as_ref().map(|p| profile_to_json_ld(p));
+
+            let mut tags = meta_tags_to_elements(vec![
                 ("og:type", "profile"),
                 ("og:title", &title),
                 ("og:description", &description),
@@ -285,7 +288,12 @@ pub async fn tag_page(
                 ("twitter:title", &title),
                 ("twitter:description", &description),
                 ("twitter:image", &image),
-            ])
+            ]);
+
+            if let Some(ld_json) = json_ld {
+                tags.push(json_ld_to_script(&ld_json));
+            }
+            tags
         }
         _ => Vec::new(),
     };
@@ -361,7 +369,9 @@ async fn get_event_tags(
             .to_bech32()
             .unwrap_or_default();
 
-            meta_tags_to_elements(vec![
+            let json_ld = live_event_to_json_ld(host_name, title_tag, stream);
+
+            let mut tags = meta_tags_to_elements(vec![
                 ("og:type", "video.other"),
                 ("og:title", &format!("{} is streaming", host_name)),
                 ("og:description", title_tag),
@@ -381,7 +391,10 @@ async fn get_event_tags(
                 ("twitter:player:width", "640"),
                 ("twitter:player:height", "480"),
                 ("twitter:text:player_height", "480"),
-            ])
+            ]);
+
+            tags.push(json_ld_to_script(&json_ld));
+            tags
         }
         Kind::Custom(1313) => {
             let profile = get_profile_meta(fetch, &ev.pubkey).await;
@@ -413,7 +426,9 @@ async fn get_event_tags(
                 .and_then(|t| t.content())
                 .unwrap_or("");
 
-            meta_tags_to_elements(vec![
+            let json_ld = clip_to_json_ld(name, title_tag, stream);
+
+            let mut tags = meta_tags_to_elements(vec![
                 ("og:type", "video.other"),
                 ("og:title", &format!("{} created a clip", name)),
                 ("og:description", title_tag),
@@ -425,7 +440,10 @@ async fn get_event_tags(
                 ("twitter:title", &format!("{} created a clip", name)),
                 ("twitter:description", title_tag),
                 ("twitter:image", &image),
-            ])
+            ]);
+
+            tags.push(json_ld_to_script(&json_ld));
+            tags
         }
         _ => {
             // Default case for regular posts
@@ -453,7 +471,9 @@ async fn get_event_tags(
                 .map(|dt| dt.to_rfc3339())
                 .unwrap_or_default();
 
-            meta_tags_to_elements(vec![
+            let json_ld = event_to_json_ld(ev, profile_name);
+
+            let mut tags = meta_tags_to_elements(vec![
                 ("og:type", "article"),
                 ("og:title", &title_content),
                 ("og:description", ""),
@@ -464,7 +484,10 @@ async fn get_event_tags(
                 ("twitter:title", &title_content),
                 ("twitter:description", ""),
                 ("twitter:image", &image),
-            ])
+            ]);
+
+            tags.push(json_ld_to_script(&json_ld));
+            tags
         }
     };
     if let Some(canonical_template) = canonical
@@ -595,6 +618,86 @@ fn meta_tags_to_elements(tags: Vec<(&str, &str)>) -> Vec<HeadElement> {
             HeadElement::new("meta", &[("property", key), ("content", value)], None)
         })
         .collect()
+}
+
+fn json_ld_to_script(json_ld: &str) -> HeadElement {
+    HeadElement::new(
+        "script",
+        &[("type", "application/ld+json")],
+        Some(json_ld),
+    )
+}
+
+fn profile_to_json_ld(profile: &ProfileMeta) -> String {
+    let name = profile.title.as_str();
+    let description = profile.description.as_str();
+    let image = profile.image.as_str();
+    
+    let json_object = json!({
+        "@context": "https://schema.org",
+        "@type": "Person",
+        "name": name,
+        "description": description,
+        "image": image
+    });
+    
+    serde_json::to_string(&json_object).unwrap_or_default()
+}
+
+fn event_to_json_ld(ev: &Event, profile_name: &str) -> String {
+    let content = ev.content.replace('\n', " ");
+    let created_iso = DateTime::from_timestamp(ev.created_at.as_secs() as i64, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_default();
+    
+    let json_object = json!({
+        "@context": "https://schema.org",
+        "@type": "Comment",
+        "name": profile_name,
+        "description": content,
+        "datePublished": created_iso,
+        "author": {
+            "@type": "Person",
+            "name": profile_name
+        }
+    });
+    
+    serde_json::to_string(&json_object).unwrap_or_default()
+}
+
+fn live_event_to_json_ld(host_name: &str, title: &str, stream_url: &str) -> String {
+    let json_object = json!({
+        "@context": "https://schema.org",
+        "@type": "BroadcastEvent",
+        "name": title,
+        "description": title,
+        "streamURL": stream_url,
+        "performer": {
+            "@type": "Person",
+            "name": host_name
+        }
+    });
+    
+    serde_json::to_string(&json_object).unwrap_or_default()
+}
+
+fn clip_to_json_ld(name: &str, title: &str, stream_url: &str) -> String {
+    let json_object = json!({
+        "@context": "https://schema.org",
+        "@type": "Clip",
+        "name": title,
+        "description": title,
+        "video": {
+            "@type": "VideoObject",
+            "contentURL": stream_url
+        },
+        "actor": {
+            "@type": "Person",
+            "name": name
+        }
+    });
+    
+    serde_json::to_string(&json_object).unwrap_or_default()
 }
 
 #[cfg(test)]
