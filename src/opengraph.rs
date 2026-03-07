@@ -517,6 +517,17 @@ async fn get_profile_meta(fetch: &FetchQueue, pubkey: &PublicKey) -> Option<Prof
 }
 
 fn inject_tags(html: &str, tags: Vec<HeadElement>) -> String {
+    // Validate HTML is well-formed before parsing
+    if html.trim().is_empty() {
+        warn!("Empty HTML provided to inject_tags");
+        return html.to_string();
+    }
+
+    if !html.contains("<html") || !html.contains("</html>") {
+        warn!("Invalid HTML: missing <html> tags");
+        return html.to_string();
+    }
+
     let doc = Html::parse_document(html);
     let head_selector = Selector::parse("head").expect("invalid selector");
 
@@ -542,20 +553,32 @@ fn inject_tags(html: &str, tags: Vec<HeadElement>) -> String {
             new_head_content.push_str(tag.to_string().as_str());
         }
 
-        // Rebuild the head element using the parsed source span
+        // Rebuild the head element by replacing its content
         let head_html = head_element.html();
         // Find the end of the opening tag within head_html
         if let Some(open_end) = head_html.find('>') {
             // Find the closing tag from the end
-            if let Some(close_start) = head_html.rfind("</head>") {
+            if let Some(_close_start) = head_html.rfind("</head>") {
                 let mut result = html.to_string();
                 // Locate the head element in the original html
                 if let Some(head_pos) = result.find("<head") {
+                    // Calculate position of opening tag end in original
                     let abs_open_end = head_pos + open_end + 1;
-                    let abs_close_start = head_pos + close_start;
-                    result.replace_range(abs_open_end..abs_close_start, &new_head_content);
+                    // Find </head> in original HTML starting from abs_open_end
+                    // This is more robust than head_pos + close_start because
+                    // the parsed HTML may have different formatting than the original
+                    if let Some(close_pos_in_html) = result[abs_open_end..].find("</head>") {
+                        let abs_close_start = abs_open_end + close_pos_in_html;
+                        result.replace_range(abs_open_end..abs_close_start, &new_head_content);
+                        
+                        // Validate the result is well-formed HTML by re-parsing
+                        if Html::parse_document(&result).select(&Selector::parse("head").unwrap()).next().is_none() {
+                            warn!("Invalid HTML: no head element found after injection");
+                            return html.to_string();
+                        }
+                        return result;
+                    }
                 }
-                return result;
             }
         }
 
@@ -1105,5 +1128,28 @@ mod tests {
             body.to_lowercase().contains("kieran") || body.contains("og:title"),
             "og:title should reference the profile, got:\n{body}"
         );
+    }
+
+    #[test]
+    fn test_inject_tags_snort_html_file() {
+        // Test using the exact HTML from snort.html
+        let html = std::fs::read_to_string("./snort.html")
+            .expect("Failed to read snort.html");
+
+        let tags = meta_tags_to_elements(vec![
+            ("og:type", "profile"),
+            ("og:title", "Test Profile"),
+            ("og:description", "Test description"),
+            ("og:image", "https://example.com/avatar.webp"),
+        ]);
+
+        let result = inject_tags(&html, tags);
+
+        // Verify og tags were replaced
+        assert!(result.contains("profile"));
+        assert!(result.contains("Test Profile"));
+        assert!(result.contains("avatar.webp"));
+        // Verify the validation worked - result should be valid HTML
+        assert!(result.contains("<body>"));
     }
 }
