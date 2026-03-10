@@ -91,6 +91,15 @@ impl HeadElement {
                         .map(|p| p.1.as_str());
                     prop_child == prop_tag
                 }
+                "link" => {
+                    let rel_child = node.attr("rel");
+                    let rel_tag = self
+                        .attributes
+                        .iter()
+                        .find(|p| p.0 == "rel")
+                        .map(|p| p.1.as_str());
+                    rel_child == rel_tag
+                }
                 _ => false,
             }
     }
@@ -103,6 +112,9 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Elements whose text content must not be HTML-escaped (raw character data).
+const RAW_CONTENT_ELEMENTS: &[&str] = &["script", "style"];
+
 impl Display for HeadElement {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "<{}", self.element)?;
@@ -111,7 +123,11 @@ impl Display for HeadElement {
         }
         if let Some(c) = &self.content {
             write!(f, ">")?;
-            write!(f, "{}", html_escape(c))?;
+            if RAW_CONTENT_ELEMENTS.contains(&self.element.as_str()) {
+                write!(f, "{}", c)?;
+            } else {
+                write!(f, "{}", html_escape(c))?;
+            }
             write!(f, "</{}>", self.element)?;
         } else {
             write!(f, " />")?;
@@ -539,7 +555,18 @@ async fn get_profile_meta(fetch: &FetchQueue, pubkey: &PublicKey) -> Option<Prof
     })
 }
 
-fn inject_tags(html: &str, tags: Vec<HeadElement>) -> String {
+fn tag_sort_key(tag: &HeadElement) -> u8 {
+    match tag.element.as_str() {
+        "meta" => 0,
+        "title" => 1,
+        "link" => 2,
+        "script" => 3,
+        _ => 4,
+    }
+}
+
+fn inject_tags(html: &str, mut tags: Vec<HeadElement>) -> String {
+    tags.sort_by_key(tag_sort_key);
     // Validate HTML is well-formed before parsing
     if html.trim().is_empty() {
         warn!("Empty HTML provided to inject_tags");
@@ -1230,6 +1257,82 @@ mod tests {
         assert!(
             body.to_lowercase().contains("kieran") || body.contains("og:title"),
             "og:title should reference the profile, got:\n{body}"
+        );
+    }
+
+    // ── tag_sort_key / inject order ──────────────────────────────────────────
+
+    #[test]
+    fn test_injected_tags_order_title_canonical_meta_script() {
+        // All four kinds appended into an empty head; title must come first,
+        // then canonical, then meta, then script (JSON-LD) last.
+        let html = r#"<!DOCTYPE html><html><head></head><body></body></html>"#;
+        let tags = vec![
+            json_ld_to_script(r#"{"@type":"Person"}"#),
+            HeadElement::new("meta", &[("property", "og:title"), ("content", "Hi")], None),
+            HeadElement::new("link", &[("rel", "canonical"), ("href", "https://example.com/")], None),
+            HeadElement::new("title", &[], Some("Hi")),
+        ];
+        let result = inject_tags(html, tags);
+        let meta_pos = result.find(r#"property="og:title""#).unwrap();
+        let title_pos = result.find("<title>").unwrap();
+        let canonical_pos = result.find(r#"rel="canonical""#).unwrap();
+        let script_pos = result.find("application/ld+json").unwrap();
+        assert!(meta_pos < title_pos, "meta should precede title");
+        assert!(title_pos < canonical_pos, "title should precede canonical");
+        assert!(canonical_pos < script_pos, "canonical should precede script");
+    }
+
+    // ── regression: duplicate canonical tag ─────────────────────────────────
+
+    #[test]
+    fn test_inject_tags_replaces_existing_canonical_not_duplicates() {
+        // The template already has a canonical link; injecting a new one must
+        // replace it rather than appending a second.
+        let html = r#"<!DOCTYPE html><html><head><link rel="canonical" href="https://example.com/" /></head><body></body></html>"#;
+        let new_canonical = HeadElement::new(
+            "link",
+            &[("rel", "canonical"), ("href", "https://example.com/page")],
+            None,
+        );
+        let result = inject_tags(html, vec![new_canonical]);
+        // Old href must be gone, new one present
+        assert!(
+            result.contains("https://example.com/page"),
+            "new canonical not found: {result}"
+        );
+        assert!(
+            !result.contains("https://example.com/\""),
+            "old canonical still present: {result}"
+        );
+        // Exactly one canonical link
+        let count = result.matches(r#"rel="canonical""#).count();
+        assert_eq!(count, 1, "expected 1 canonical, found {count}: {result}");
+    }
+
+    // ── regression: JSON-LD must not be HTML-escaped ─────────────────────────
+
+    #[test]
+    fn test_json_ld_to_script_is_not_html_escaped() {
+        let json = r#"{"@context":"https://schema.org","@type":"Person","name":"Alice"}"#;
+        let el = json_ld_to_script(json);
+        let rendered = el.to_string();
+        // Raw quotes must appear verbatim, not as &quot;
+        assert!(
+            rendered.contains('"'),
+            "JSON-LD content contains escaped quotes: {rendered}"
+        );
+        assert!(
+            !rendered.contains("&quot;"),
+            "JSON-LD content was HTML-escaped: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"type="application/ld+json""#),
+            "script type attribute missing: {rendered}"
+        );
+        assert!(
+            rendered.contains(json),
+            "original JSON not present verbatim: {rendered}"
         );
     }
 
