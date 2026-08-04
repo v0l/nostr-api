@@ -91,9 +91,11 @@ impl LinkPreviewCache {
 
         Self {
             cache: Cache::builder()
+                .max_capacity(100_000)
                 .time_to_live(Duration::from_secs(24 * 60 * 60)) // 1 day
                 .build(),
             empty_cache: Cache::builder()
+                .max_capacity(100_000)
                 .time_to_live(Duration::from_secs(10 * 60)) // 10 minutes
                 .build(),
             client,

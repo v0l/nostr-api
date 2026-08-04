@@ -74,12 +74,9 @@ async fn main() -> Result<()> {
     client.connect().await;
 
     let fetch = FetchQueue::new(client.clone());
-    let fetch_worker = fetch.clone();
-    tokio::spawn(async move {
-        loop {
-            fetch_worker.process_queue().await;
-        }
-    });
+    // Multiple workers service the fetch queue concurrently so a slow relay
+    // cannot serialize all on-demand lookups behind a single worker.
+    fetch.clone().spawn_workers(4);
 
     let link_preview_cache = Arc::new(link_preview::LinkPreviewCache::new());
     let http_client = Arc::new(link_preview_cache.client().clone());
