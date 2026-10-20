@@ -4,3 +4,8 @@ relays:
   - "wss://relay.damus.io"
   - "wss://nos.lol"
   - "wss://relay.primal.net"
+# OpenAI compatible endpoint for POST /translate (omit to disable)
+#translate:
+#  api_base: "https://api.openai.com/v1"
+#  model: "gpt-4o-mini"
+#  api_key: ""

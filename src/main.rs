@@ -20,6 +20,7 @@ mod fetch;
 mod link_preview;
 mod opengraph;
 mod settings;
+mod translate;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -27,6 +28,7 @@ pub struct AppState {
     pub link_preview: Arc<link_preview::LinkPreviewCache>,
     pub http_client: Arc<reqwest::Client>,
     pub avatar_sets: avatar::AvatarSets,
+    pub translator: translate::Translator,
 }
 
 impl FromRef<AppState> for FetchQueue {
@@ -53,6 +55,12 @@ impl FromRef<AppState> for avatar::AvatarSets {
     }
 }
 
+impl FromRef<AppState> for translate::Translator {
+    fn from_ref(state: &AppState) -> Self {
+        state.translator.clone()
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
@@ -62,7 +70,7 @@ async fn main() -> Result<()> {
 
     let builder = Config::builder()
         .add_source(config::File::with_name("config.yaml").required(false))
-        .add_source(config::Environment::with_prefix("APP"))
+        .add_source(config::Environment::with_prefix("APP").prefix_separator("_").separator("__"))
         .build()?;
 
     let settings: Settings = builder.try_deserialize()?;
@@ -87,6 +95,7 @@ async fn main() -> Result<()> {
         link_preview: link_preview_cache,
         http_client,
         avatar_sets,
+        translator: translate::Translator::new(settings.translate.as_ref()),
     };
 
     let app = Router::new()
@@ -98,6 +107,8 @@ async fn main() -> Result<()> {
         .route("/event/{id}", get(events::get_event))
         .route("/event/{kind}/{pubkey}", get(events::get_event_by_kind))
         .route("/preview", get(link_preview::get_preview))
+        .route("/translate", post(translate::translate))
+        .route("/api/v1/translate", post(translate::translate))
         .route("/opengraph/{id}", post(opengraph::tag_page))
         .with_state(state)
         .layer(CorsLayer::very_permissive());

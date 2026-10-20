@@ -153,6 +153,33 @@ paths:
         '500':
           description: Internal server error
 
+  /translate:
+    post:
+      summary: Translate text
+      description: Detects the source language locally, then translates each text with the configured OpenAI compatible model. Results are cached for 30 days. Also served at `/api/v1/translate` for the Snort client.
+      operationId: translate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TranslateRequest'
+      responses:
+        '200':
+          description: Translations in request order
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TranslateResponse'
+        '204':
+          description: Nothing to translate, every text is already in the target language or could not be identified
+        '400':
+          description: Empty input, more than 50 texts, more than 20000 characters or no target language
+        '502':
+          description: The translation model failed
+        '503':
+          description: Translation is not configured
+
   /opengraph/{id}:
     post:
       summary: Inject OpenGraph tags
@@ -201,6 +228,31 @@ paths:
 
 components:
   schemas:
+    TranslateRequest:
+      type: object
+      required: [text, target_lang]
+      properties:
+        text:
+          type: array
+          maxItems: 50
+          items:
+            type: string
+        target_lang:
+          type: string
+          example: EN
+    TranslateResponse:
+      type: object
+      properties:
+        translations:
+          type: array
+          items:
+            type: object
+            properties:
+              detected_source_language:
+                type: string
+                example: ES
+              text:
+                type: string
     NostrEvent:
       type: object
       required:

@@ -1292,6 +1292,7 @@ mod tests {
             link_preview: link_preview_cache,
             http_client,
             avatar_sets,
+            translator: crate::translate::Translator::new(None),
         };
 
         let app = Router::new()

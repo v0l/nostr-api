@@ -10,6 +10,7 @@ Built with Rust, [axum](https://github.com/tokio-rs/axum), and [nostr-sdk](https
 - **OpenGraph injection** — POST any HTML document with a Nostr identifier and get `og:*` and `twitter:*` meta tags (plus JSON-LD) injected for rich social-media previews. Handles profiles, notes, live streams, and stream clips.
 - **Link previews** — scrape OpenGraph metadata from arbitrary URLs, with positive and negative caching.
 - **Deterministic avatars** — hash-based avatar selection from bundled image sets (`cyberpunks`, `robots`, `zombies`), served straight from memory with `ETag`/`304` support.
+- **Translation**: `/translate` detects the source language locally and translates through any OpenAI compatible chat endpoint, with a 30 day in-process cache.
 - **NIP-05 resolution** — profile identifiers like `name@domain.tld` are resolved automatically, cached in-process.
 
 ## Quick start
@@ -89,6 +90,29 @@ GET /preview?url={url}             Scrape OpenGraph metadata from a URL
 ```
 
 Only `https` URLs with public hosts are accepted (private/loopback addresses are rejected). Returns `title`, `description`, `image`, and the raw `og:*` tag pairs as JSON. Successful results are cached for 24 hours; failed fetches are cached for 10 minutes so a bad URL isn't hammered.
+
+### Translation
+
+```
+POST /translate                    Translate text through an LLM (also served at /api/v1/translate)
+```
+
+```json
+{"text": ["Hola amigos"], "target_lang": "EN"}
+```
+
+Replies `{"translations": [{"detected_source_language": "ES", "text": "Hello friends"}]}`, the same shape the Snort client already reads. The source language is detected locally (whatlang) before any model call. `204` is returned when every entry is already in the target language or cannot be identified, `400` for empty input, more than 50 texts or more than 20,000 characters, `502` when the model call fails and `503` when `translate` is not configured. `target_lang` accepts ISO 639-1/639-3 codes with an optional region (`PT-BR`).
+
+Enable it in `config.yaml`:
+
+```yaml
+translate:
+  api_base: "https://yalr.v0l.io/v1"
+  model: "your-model"
+  api_key: "sk-..."   # optional
+```
+
+or with `APP_TRANSLATE__API_BASE`, `APP_TRANSLATE__MODEL` and `APP_TRANSLATE__API_KEY`.
 
 ### Avatars
 
