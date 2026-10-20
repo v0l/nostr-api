@@ -9,3 +9,5 @@ relays:
 #  api_base: "https://api.openai.com/v1"
 #  model: "gpt-4o-mini"
 #  api_key: ""
+#  allowed_hosts: ["snort.social", "phoenix.social"]
+#  max_concurrent: 8

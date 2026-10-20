@@ -114,6 +114,8 @@ translate:
 
 or with `APP_TRANSLATE__API_BASE`, `APP_TRANSLATE__MODEL` and `APP_TRANSLATE__API_KEY`.
 
+`allowed_hosts` restricts callers by `Origin` or `Referer` host (subdomains included); anything else gets `403`. `max_concurrent` (default 8) caps simultaneous model calls and answers `429` beyond that. Cache hits and already-translated text never use a slot. Origin checks stop browsers on other sites, not scripts that spoof the header, so keep an ingress rate limit in front.
+
 ### Avatars
 
 ```

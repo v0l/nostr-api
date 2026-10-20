@@ -19,6 +19,14 @@ pub struct TranslateSettings {
     pub model: String,
     #[serde(default)]
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent: usize,
+}
+
+fn default_max_concurrent() -> usize {
+    8
 }
 #[cfg(test)]
 mod tests {
@@ -46,5 +54,20 @@ mod tests {
         let t = s.translate.unwrap();
         assert_eq!((t.api_base.as_str(), t.model.as_str()), ("http://x/v1", "m"));
         assert!(t.api_key.is_none());
+        assert!(t.allowed_hosts.is_empty());
+        assert_eq!(t.max_concurrent, 8);
+    }
+
+    #[test]
+    fn translate_policy_parses_from_yaml() {
+        let yaml = "relays: []\ntranslate:\n  api_base: http://x/v1\n  model: m\n  allowed_hosts: [snort.social]\n  max_concurrent: 2\n";
+        let cfg = Config::builder()
+            .add_source(File::from_str(yaml, FileFormat::Yaml))
+            .build()
+            .unwrap();
+        let t: Settings = cfg.try_deserialize().unwrap();
+        let t = t.translate.unwrap();
+        assert_eq!(t.allowed_hosts, vec!["snort.social".to_string()]);
+        assert_eq!(t.max_concurrent, 2);
     }
 }

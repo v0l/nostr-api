@@ -10,7 +10,7 @@ use async_openai::types::chat::{
 };
 use axum::Json;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures::future::BoxFuture;
 use futures::{StreamExt, stream};
@@ -18,6 +18,7 @@ use isolang::Language;
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 
 use crate::settings::TranslateSettings;
 
@@ -77,12 +78,18 @@ impl Completer for OpenAiCompleter {
 pub struct Translator {
     completer: Option<Arc<dyn Completer>>,
     cache: Cache<String, Arc<Vec<Translation>>>,
+    allowed_hosts: Arc<Vec<String>>,
+    permits: Arc<Semaphore>,
 }
 
 impl Translator {
     pub fn new(settings: Option<&TranslateSettings>) -> Self {
         let completer = settings.map(|s| Arc::new(OpenAiCompleter::new(s)) as Arc<dyn Completer>);
-        Self::with_completer(completer)
+        let translator = Self::with_completer(completer);
+        match settings {
+            Some(s) => translator.with_policy(s.allowed_hosts.clone(), s.max_concurrent),
+            None => translator,
+        }
     }
 
     pub fn with_completer(completer: Option<Arc<dyn Completer>>) -> Self {
@@ -92,7 +99,38 @@ impl Translator {
                 .max_capacity(CACHE_CAPACITY)
                 .time_to_live(CACHE_TTL)
                 .build(),
+            allowed_hosts: Arc::new(Vec::new()),
+            permits: Arc::new(Semaphore::new(8)),
         }
+    }
+
+    pub fn with_policy(mut self, allowed_hosts: Vec<String>, max_concurrent: usize) -> Self {
+        self.allowed_hosts = Arc::new(
+            allowed_hosts
+                .into_iter()
+                .map(|h| h.trim().trim_start_matches('.').to_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect(),
+        );
+        self.permits = Arc::new(Semaphore::new(max_concurrent));
+        self
+    }
+
+    fn origin_allowed(&self, headers: &HeaderMap) -> bool {
+        if self.allowed_hosts.is_empty() {
+            return true;
+        }
+        [header::ORIGIN, header::REFERER]
+            .iter()
+            .filter_map(|name| headers.get(name))
+            .filter_map(|v| v.to_str().ok())
+            .filter_map(|v| reqwest::Url::parse(v).ok())
+            .filter_map(|u| u.host_str().map(str::to_lowercase))
+            .any(|host| {
+                self.allowed_hosts
+                    .iter()
+                    .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")))
+            })
     }
 }
 
@@ -216,11 +254,15 @@ fn cache_key(texts: &[String], target: &str) -> String {
 
 pub async fn translate(
     State(translator): State<Translator>,
+    headers: HeaderMap,
     Json(req): Json<TranslateRequest>,
 ) -> Response {
     let Some(completer) = translator.completer.clone() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    if !translator.origin_allowed(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
     let total: usize = req.text.iter().map(|t| t.chars().count()).sum();
     if req.text.is_empty()
@@ -245,6 +287,10 @@ pub async fn translate(
     if !detected.iter().any(|d| needs_translation(d, &target)) {
         return StatusCode::NO_CONTENT.into_response();
     }
+
+    let Ok(_permit) = translator.permits.clone().try_acquire_owned() else {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    };
 
     let system = system_prompt(&req.target_lang);
     let items: Vec<(String, Option<Detected>)> = req.text.into_iter().zip(detected).collect();
@@ -447,6 +493,8 @@ mod tests {
             api_base: "http://localhost:1/v1".into(),
             model: "m".into(),
             api_key: None,
+            allowed_hosts: vec!["snort.social".into()],
+            max_concurrent: 1,
         };
         let t = Translator::new(Some(&settings));
         assert!(t.completer.is_some());
@@ -459,6 +507,8 @@ mod tests {
             api_base: "http://127.0.0.1:1/v1".into(),
             model: "m".into(),
             api_key: Some("k".into()),
+            allowed_hosts: vec![],
+            max_concurrent: 1,
         };
         let c = OpenAiCompleter::new(&settings);
         assert!(c.complete("s".into(), "u".into()).await.is_err());
@@ -499,6 +549,8 @@ mod tests {
             api_base,
             model: "m".into(),
             api_key: Some("k".into()),
+            allowed_hosts: vec![],
+            max_concurrent: 1,
         });
         assert_eq!(c.complete("s".into(), "u".into()).await.unwrap(), "Hello friends");
     }
@@ -510,6 +562,8 @@ mod tests {
             api_base,
             model: "m".into(),
             api_key: None,
+            allowed_hosts: vec![],
+            max_concurrent: 1,
         });
         assert!(c.complete("s".into(), "u".into()).await.is_err());
     }
@@ -657,6 +711,88 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    fn policy_app(fake: Arc<Fake>, max_concurrent: usize) -> Router {
+        Router::new().route("/translate", post(translate)).with_state(
+            Translator::with_completer(Some(fake))
+                .with_policy(vec!["snort.social".into(), " .Phoenix.social ".into(), "".into()], max_concurrent),
+        )
+    }
+
+    async fn call_with(app: Router, headers: &[(&str, &str)]) -> StatusCode {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/translate")
+            .header("content-type", "application/json");
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let body = serde_json::json!({"text": [SPANISH], "target_lang": "EN"});
+        app.oneshot(req.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn allowed_origin_and_referer_pass() {
+        let router = policy_app(Fake::ok("Hello"), 8);
+        for headers in [
+            vec![("origin", "https://snort.social")],
+            vec![("origin", "https://phoenix.social")],
+            vec![("origin", "https://iris.snort.social")],
+            vec![("referer", "https://snort.social/e/note1abc")],
+            vec![("origin", "null"), ("referer", "https://phoenix.social/")],
+        ] {
+            assert_eq!(call_with(router.clone(), &headers).await, StatusCode::OK, "{headers:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn foreign_or_missing_origin_is_forbidden() {
+        let fake = Fake::ok("Hello");
+        let router = policy_app(fake.clone(), 8);
+        for headers in [
+            vec![],
+            vec![("origin", "https://evil.example")],
+            vec![("origin", "https://snort.social.evil.example")],
+            vec![("origin", "https://notsnort.social")],
+            vec![("origin", "not a url")],
+            vec![("referer", "https://evil.example/?https://snort.social")],
+        ] {
+            assert_eq!(call_with(router.clone(), &headers).await, StatusCode::FORBIDDEN, "{headers:?}");
+        }
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn no_free_permit_is_too_many_requests() {
+        let fake = Fake::ok("Hello");
+        let router = policy_app(fake.clone(), 0);
+        let status = call_with(router, &[("origin", "https://snort.social")]).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cached_and_untranslatable_requests_do_not_need_a_permit() {
+        let fake = Fake::ok("Hello");
+        let router = policy_app(fake, 0);
+        let body = serde_json::json!({"text": [ENGLISH], "target_lang": "EN"});
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/translate")
+                    .header("content-type", "application/json")
+                    .header("origin", "https://snort.social")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]

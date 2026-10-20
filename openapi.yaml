@@ -177,6 +177,10 @@ paths:
           description: Empty input, more than 50 texts, more than 20000 characters or no target language
         '502':
           description: The translation model failed
+        '403':
+          description: Origin or Referer host is not in the configured allow list
+        '429':
+          description: Too many translations in flight
         '503':
           description: Translation is not configured
 
